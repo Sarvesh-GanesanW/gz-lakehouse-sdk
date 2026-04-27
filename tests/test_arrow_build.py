@@ -24,7 +24,7 @@ def test_arrow_type_for_unknown_falls_back_to_string() -> None:
 
 
 def test_arrow_type_for_native_arrow_strings() -> None:
-    """Arrow's own ``str(type)`` form (used by the pod manifest) maps cleanly."""
+    """Arrow's own ``str(type)`` form (used by the pod) maps cleanly."""
     assert arrow_type_for("int64") == pa.int64()
     assert arrow_type_for("int32") == pa.int32()
     assert arrow_type_for("float64") == pa.float64()

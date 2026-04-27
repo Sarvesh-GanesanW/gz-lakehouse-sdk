@@ -364,7 +364,7 @@ class Transport:
         return table
 
     def _build_s3_session(self) -> requests.Session:
-        """Build the S3-side requests session with retries + connection pool."""
+        """Build the S3-side session with retries and connection pool."""
         retry = Retry(
             total=self._config.max_retries,
             connect=self._config.max_retries,

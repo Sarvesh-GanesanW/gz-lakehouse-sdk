@@ -80,7 +80,7 @@ class LakehouseClient:
         compute_id: int | None = None,
         **extra: Any,
     ) -> LakehouseClient:
-        """Build a client without constructing :class:`LakehouseConfig` first."""
+        """Build a client without explicitly constructing a config."""
         config = LakehouseConfig(
             lakehouse_url=lakehouse_url,
             warehouse=warehouse,

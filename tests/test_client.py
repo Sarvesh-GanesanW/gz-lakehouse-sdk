@@ -1,4 +1,4 @@
-"""Tests for :class:`gz_lakehouse.LakehouseClient` against a mocked provider."""
+"""Tests for :class:`LakehouseClient` against a mocked provider."""
 
 import io
 
@@ -129,7 +129,7 @@ def test_authentication_failure_raises() -> None:
 
 @responses.activate
 def test_query_error_raises() -> None:
-    """An ``error`` envelope from the provider surfaces as :class:`QueryError`."""
+    """An ``error`` envelope surfaces as :class:`QueryError`."""
     _add_verify_response()
     responses.add(
         responses.POST,

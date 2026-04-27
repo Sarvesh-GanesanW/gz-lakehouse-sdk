@@ -48,19 +48,19 @@ The client picks `gz-site` automatically from the URL host (the second hyphen-se
 
 ## Public API
 
-| Symbol | Purpose |
-|--------|---------|
-| `LakehouseClient` | Connect, verify, run queries, stream batches, fan out partitioned queries |
-| `LakehouseConfig` | Frozen dataclass for connection params + perf knobs |
-| `QueryResult` | Wraps an Arrow table + schema; converts to pandas / Spark / list |
-| `GzLakehouseError` | Base exception |
-| `AuthenticationError` | HTTP 401 from provider |
-| `AuthorizationError` | HTTP 403 from provider |
-| `QueryError` | Parent for query failures (kept for back-compat) |
-| `QueryValidationError` | Caller-side query problem (never retried) |
-| `QueryExecutionError` | Provider-side execution failure |
-| `TransportError` | Network failure or timeout |
-| `ConfigurationError` | Invalid configuration |
+| Symbol                 | Purpose                                                                   |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `LakehouseClient`      | Connect, verify, run queries, stream batches, fan out partitioned queries |
+| `LakehouseConfig`      | Frozen dataclass for connection params + perf knobs                       |
+| `QueryResult`          | Wraps an Arrow table + schema; converts to pandas / Spark / list          |
+| `GzLakehouseError`     | Base exception                                                            |
+| `AuthenticationError`  | HTTP 401 from provider                                                    |
+| `AuthorizationError`   | HTTP 403 from provider                                                    |
+| `QueryError`           | Parent for query failures (kept for back-compat)                          |
+| `QueryValidationError` | Caller-side query problem (never retried)                                 |
+| `QueryExecutionError`  | Provider-side execution failure                                           |
+| `TransportError`       | Network failure or timeout                                                |
+| `ConfigurationError`   | Invalid configuration                                                     |
 
 ## Data plane
 
@@ -91,11 +91,11 @@ Each chunk is parsed straight into a `pyarrow.Table` with no Python-object inter
 
 ### Throughput targets
 
-| Workload | Target throughput | Knob |
-|---|---|---|
-| 8 workers, 20 MB chunks, 1 Gb/s link | **~110 MB/s** (link-bound) | `parallel_workers=8` |
-| 16 workers, 20 MB chunks, 10 Gb/s link | **~700 MB/s – 1 GB/s** | `parallel_workers=16` + `pool_maxsize>=16` |
-| Single-chunk small result | **~50–100 ms** end to end | first-chunk latency dominates |
+| Workload                               | Target throughput          | Knob                                       |
+| -------------------------------------- | -------------------------- | ------------------------------------------ |
+| 8 workers, 20 MB chunks, 1 Gb/s link   | **~110 MB/s** (link-bound) | `parallel_workers=8`                       |
+| 16 workers, 20 MB chunks, 10 Gb/s link | **~700 MB/s – 1 GB/s**     | `parallel_workers=16` + `pool_maxsize>=16` |
+| Single-chunk small result              | **~50–100 ms** end to end  | first-chunk latency dominates              |
 
 The numbers scale with `parallel_workers` up to the smaller of (a) the client's bandwidth, (b) the provider's S3 fan-out cap, and (c) the chunk count. Snowflake-class throughput is built in.
 
@@ -103,11 +103,11 @@ The numbers scale with `parallel_workers` up to the smaller of (a) the client's 
 
 `result.to_spark(spark)` picks the fastest available conversion path automatically:
 
-| PySpark version | Path | Throughput |
-|---|---|---|
-| **3.4+** | `spark.createDataFrame(arrow_table)` direct | **100–200 MB/s** |
-| **3.0–3.3** | Arrow-enabled pandas (auto-toggles `spark.sql.execution.arrow.pyspark.enabled`) | 50–100 MB/s |
-| **< 3.0** | Plain pandas (warned about) | 5–10 MB/s |
+| PySpark version | Path                                                                            | Throughput       |
+| --------------- | ------------------------------------------------------------------------------- | ---------------- |
+| **3.4+**        | `spark.createDataFrame(arrow_table)` direct                                     | **100–200 MB/s** |
+| **3.0–3.3**     | Arrow-enabled pandas (auto-toggles `spark.sql.execution.arrow.pyspark.enabled`) | 50–100 MB/s      |
+| **< 3.0**       | Plain pandas (warned about)                                                     | 5–10 MB/s        |
 
 ```python
 df = result.to_spark(spark)
@@ -163,15 +163,15 @@ Each subquery hits `/iceberg/v1/statements` independently, downloads its own pre
 
 All exposed on `LakehouseConfig`:
 
-| Field | Default | Purpose |
-|---|---|---|
-| `parallel_workers` | `8` | Concurrent chunk downloads (and `query_parallel` fan-out) |
-| `pool_connections` | `4` | HTTP connection pools the session keeps |
-| `pool_maxsize` | `16` | Max connections per pool (auto-bumped to ≥ `parallel_workers`) |
-| `connect_timeout_seconds` | `10` | TCP/TLS handshake timeout |
-| `query_timeout_seconds` | `900` | Per-request read timeout |
-| `max_retries` | `3` | Retries on 408/429/500/502/503/504 (respects `Retry-After`) |
-| `enable_compression` | `True` | Advertise `gzip, deflate, zstd` for the metadata envelope |
+| Field                     | Default | Purpose                                                        |
+| ------------------------- | ------- | -------------------------------------------------------------- |
+| `parallel_workers`        | `8`     | Concurrent chunk downloads (and `query_parallel` fan-out)      |
+| `pool_connections`        | `4`     | HTTP connection pools the session keeps                        |
+| `pool_maxsize`            | `16`    | Max connections per pool (auto-bumped to ≥ `parallel_workers`) |
+| `connect_timeout_seconds` | `10`    | TCP/TLS handshake timeout                                      |
+| `query_timeout_seconds`   | `900`   | Per-request read timeout                                       |
+| `max_retries`             | `3`     | Retries on 408/429/500/502/503/504 (respects `Retry-After`)    |
+| `enable_compression`      | `True`  | Advertise `gzip, deflate, zstd` for the metadata envelope      |
 
 ### Logging
 

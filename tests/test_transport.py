@@ -78,7 +78,7 @@ def _envelope(chunk_count: int, total_rows: int) -> dict:
 
 @responses.activate
 def test_execute_downloads_arrow_chunks_in_parallel() -> None:
-    """All presigned chunks are fetched and concatenated in submission order."""
+    """All chunks are fetched and concatenated in submission order."""
     chunks = [
         pa.table({"id": [1, 2], "name": ["a", "b"]}),
         pa.table({"id": [3, 4], "name": ["c", "d"]}),
@@ -204,7 +204,7 @@ def test_envelope_with_invalid_chunks_raises() -> None:
 
 @responses.activate
 def test_envelope_status_error_raises() -> None:
-    """An ``error`` envelope status surfaces as :class:`QueryExecutionError`."""
+    """An ``error`` envelope surfaces as :class:`QueryExecutionError`."""
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/v1/statements",

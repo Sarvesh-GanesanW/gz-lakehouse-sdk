@@ -28,7 +28,7 @@ class AuthorizationError(GzLakehouseError):
 
 
 class TransportError(GzLakehouseError):
-    """Raised when the lakehouse provider URL cannot be reached or times out."""
+    """Raised when the provider URL cannot be reached or times out."""
 
 
 class QueryError(GzLakehouseError):

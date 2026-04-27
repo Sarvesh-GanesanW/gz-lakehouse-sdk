@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 class QueryResult:
-    """Holds the Arrow table and metadata returned by the lakehouse provider."""
+    """Holds the Arrow table and metadata returned by the provider."""
 
     def __init__(
         self,

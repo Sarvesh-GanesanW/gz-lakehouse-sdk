@@ -198,7 +198,8 @@ class HttpClient:
         exception.
 
         Args:
-            path: Path relative to the base URL, e.g. ``/iceberg/v1/statements``.
+            path: Path relative to the base URL,
+                e.g. ``/iceberg/v1/statements``.
             json_body: Payload serialised as JSON.
             timeout_seconds: Per-request read timeout. The connect
                 timeout is taken from the client configuration.
