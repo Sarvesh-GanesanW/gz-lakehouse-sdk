@@ -46,8 +46,10 @@ class LakehouseConfig:
         compute_size: T-shirt-size compute selector. One of
             ``small`` / ``medium`` / ``large`` / ``xlarge`` / ``2xlarge``.
             The provider maps the name to a concrete compute id
-            (currently 1003 / 1006 / 1009 / 1012 / 1015 → 8 / 16 /
-            24 / 32 / 64 vCPUs). Defaults to ``small``.
+            (currently 1003 / 1006 / 1009 / 1012 / 1015), each backed
+            by a fixed memory + vCPU spec maintained server-side
+            (small ≈ 8 GB, 2xlarge ≈ 64 GB at the time of writing).
+            Defaults to ``small``.
         compute_id: Raw compute id escape hatch. When set, overrides
             ``compute_size``. Useful only when the provider exposes a
             compute id not yet covered by the t-shirt vocabulary.
