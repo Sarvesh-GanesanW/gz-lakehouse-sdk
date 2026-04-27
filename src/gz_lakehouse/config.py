@@ -87,9 +87,9 @@ class LakehouseConfig:
     query_timeout_seconds: int = 900
     connect_timeout_seconds: int = 10
     prefer_arrow: bool = True
-    parallel_workers: int = 8
+    parallel_workers: int = 32
     pool_connections: int = 4
-    pool_maxsize: int = 16
+    pool_maxsize: int = 64
     max_retries: int = 3
     backoff_seconds: float = 0.5
     enable_compression: bool = True

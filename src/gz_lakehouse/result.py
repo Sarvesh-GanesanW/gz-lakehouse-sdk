@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame
     from pyspark.sql import SparkSession
 
+    from gz_lakehouse._transport import TransportTimings
+
 
 class QueryResult:
     """Holds the Arrow table and metadata returned by the provider."""
@@ -36,6 +38,7 @@ class QueryResult:
         schema: list[Mapping[str, Any]],
         truncated: bool,
         total_rows: int,
+        timings: TransportTimings | None = None,
     ) -> None:
         """Initialise the result wrapper.
 
@@ -48,11 +51,16 @@ class QueryResult:
             truncated: True when the provider capped the result and
                 more rows would be available with a different read path.
             total_rows: Number of rows the provider materialised.
+            timings: Wall-clock breakdown for the execution. ``None``
+                only when the result is constructed by callers that
+                bypass the transport (tests, fanned-out subqueries
+                whose individual timings are merged elsewhere).
         """
         self._table = table
         self._schema = schema
         self._truncated = truncated
         self._total_rows = total_rows
+        self._timings = timings
 
     @property
     def schema(self) -> list[Mapping[str, Any]]:
@@ -73,6 +81,18 @@ class QueryResult:
     def truncated(self) -> bool:
         """True when the provider reported ``hasMore`` on this result."""
         return self._truncated
+
+    @property
+    def timings(self) -> TransportTimings | None:
+        """Wall-clock breakdown for the execution that produced this result.
+
+        ``None`` for results constructed without a transport (test
+        fixtures, manually-merged fan-outs). Otherwise exposes
+        ``submit_seconds`` (HTTP submit + pod execution + presigning),
+        ``download_seconds`` (parallel chunk fetch + Arrow parse),
+        ``chunk_count``, and on-the-wire / decoded byte counts.
+        """
+        return self._timings
 
     def to_arrow(self) -> pa.Table:
         """Return the underlying :class:`pyarrow.Table`."""

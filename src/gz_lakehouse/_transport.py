@@ -83,12 +83,42 @@ _COMPUTE_SIZE_TO_ID: dict[str, int] = {
 _logger = get_logger("transport")
 
 
+class TransportTimings:
+    """Per-execution wall-clock breakdown captured by :class:`Transport`.
+
+    Useful for benchmarks and ops dashboards: the three numbers add up
+    to the total query latency and split cleanly into the two phases
+    that dominate it (server-side compute + client-side download).
+    """
+
+    def __init__(
+        self,
+        submit_seconds: float,
+        download_seconds: float,
+        chunk_count: int,
+        compressed_bytes: int,
+        uncompressed_bytes: int,
+    ) -> None:
+        """Hold the timing and size breakdown for a single execution."""
+        self.submit_seconds = submit_seconds
+        self.download_seconds = download_seconds
+        self.chunk_count = chunk_count
+        self.compressed_bytes = compressed_bytes
+        self.uncompressed_bytes = uncompressed_bytes
+
+    @property
+    def total_seconds(self) -> float:
+        """Sum of submit + download time."""
+        return self.submit_seconds + self.download_seconds
+
+
 class TransportResult:
     """Outcome of a successful statement execution.
 
     Always exposes a single :class:`pyarrow.Table` regardless of how
     many chunks the provider returned, alongside metadata other layers
-    consume (truncation flag, total row count, descriptor list).
+    consume (truncation flag, total row count, descriptor list,
+    per-execution timing breakdown).
     """
 
     def __init__(
@@ -97,12 +127,14 @@ class TransportResult:
         truncated: bool,
         total_rows: int,
         schema: list[dict[str, str]],
+        timings: TransportTimings,
     ) -> None:
         """Hold the materialised Arrow table and provider metadata."""
         self.table = table
         self.truncated = truncated
         self.total_rows = total_rows
         self.schema = schema
+        self.timings = timings
 
 
 class _Envelope:
@@ -148,13 +180,30 @@ class Transport:
         the session pod's warm Spark cluster, then returns presigned
         chunk URLs which we download in parallel.
         """
+        submit_started = time.monotonic()
         envelope = self._submit(session_id, sql, target_chunks)
+        submit_seconds = time.monotonic() - submit_started
+
+        compressed_bytes = sum(
+            int(c.get("compressedSize") or 0) for c in envelope.chunks
+        )
+        uncompressed_bytes = sum(
+            int(c.get("uncompressedSize") or 0) for c in envelope.chunks
+        )
+
         if not envelope.chunks:
             return TransportResult(
                 table=empty_table_for(envelope.schema),
                 truncated=envelope.truncated,
                 total_rows=envelope.total_rows,
                 schema=envelope.schema,
+                timings=TransportTimings(
+                    submit_seconds=submit_seconds,
+                    download_seconds=0.0,
+                    chunk_count=0,
+                    compressed_bytes=0,
+                    uncompressed_bytes=0,
+                ),
             )
 
         workers = self._workers_for(envelope.chunks)
@@ -163,10 +212,12 @@ class Transport:
             len(envelope.chunks),
             workers,
         )
+        download_started = time.monotonic()
         with ThreadPoolExecutor(max_workers=workers) as pool:
             tables = list(pool.map(self._download_chunk, envelope.chunks))
-
         table = pa.concat_tables(tables, promote_options="default")
+        download_seconds = time.monotonic() - download_started
+
         descriptors = (
             envelope.schema
             if envelope.schema
@@ -180,6 +231,13 @@ class Transport:
             truncated=envelope.truncated,
             total_rows=total_rows,
             schema=descriptors,
+            timings=TransportTimings(
+                submit_seconds=submit_seconds,
+                download_seconds=download_seconds,
+                chunk_count=len(envelope.chunks),
+                compressed_bytes=compressed_bytes,
+                uncompressed_bytes=uncompressed_bytes,
+            ),
         )
 
     def iter_batches(

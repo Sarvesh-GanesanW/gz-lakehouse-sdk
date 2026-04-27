@@ -93,6 +93,7 @@ class Session:
             schema=outcome.schema,
             truncated=outcome.truncated,
             total_rows=outcome.total_rows,
+            timings=outcome.timings,
         )
 
     def iter_batches(
