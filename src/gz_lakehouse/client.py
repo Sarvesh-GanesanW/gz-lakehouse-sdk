@@ -114,7 +114,6 @@ class LakehouseClient:
     def query(
         self,
         sql: str,
-        target_chunks: int | None = None,
     ) -> QueryResult:
         """Convenience: create a session, run ``sql``, stop the session.
 
@@ -122,13 +121,12 @@ class LakehouseClient:
         work, prefer :meth:`start_session` so the cost is amortised.
         """
         with self.start_session() as session:
-            return session.query(sql, target_chunks=target_chunks)
+            return session.query(sql)
 
     def iter_batches(
         self,
         sql: str,
         batch_size: int = 65_536,
-        target_chunks: int | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Convenience-streaming wrapper.
 
@@ -141,7 +139,6 @@ class LakehouseClient:
             yield from session.iter_batches(
                 sql,
                 batch_size=batch_size,
-                target_chunks=target_chunks,
             )
         finally:
             session.stop()

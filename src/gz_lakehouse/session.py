@@ -78,7 +78,6 @@ class Session:
     def query(
         self,
         sql: str,
-        target_chunks: int | None = None,
     ) -> QueryResult:
         """Execute ``sql`` and return the materialised :class:`QueryResult`."""
         self._validate_sql(sql)
@@ -86,7 +85,6 @@ class Session:
         outcome = self._transport.execute(
             self._session_id,
             sql,
-            target_chunks=target_chunks,
         )
         return QueryResult(
             table=outcome.table,
@@ -100,7 +98,6 @@ class Session:
         self,
         sql: str,
         batch_size: int = 65_536,
-        target_chunks: int | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result of ``sql`` as :class:`pyarrow.RecordBatch`."""
         self._validate_sql(sql)
@@ -109,7 +106,6 @@ class Session:
             self._session_id,
             sql,
             batch_size=batch_size,
-            target_chunks=target_chunks,
         )
 
     def query_parallel(

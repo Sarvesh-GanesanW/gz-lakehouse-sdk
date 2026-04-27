@@ -334,28 +334,6 @@ def test_submit_payload_includes_session_id() -> None:
 
 
 @responses.activate
-def test_submit_payload_includes_target_chunks_when_set() -> None:
-    """``target_chunks`` is forwarded when explicitly provided."""
-    responses.add(
-        responses.POST,
-        f"{PROVIDER_URL}/iceberg/v1/statements",
-        json={"schema": [], "totalRecords": 0, "chunks": []},
-        status=200,
-    )
-
-    config = _config()
-    http = _http(config)
-    transport = Transport(http=http, config=config)
-
-    transport.execute(SESSION_ID, "SELECT 1", target_chunks=16)
-
-    body = _json.loads(responses.calls[0].request.body)
-    assert body["targetChunks"] == 16
-    transport.close()
-    http.close()
-
-
-@responses.activate
 def test_chunk_download_failure_surfaces() -> None:
     """A non-200 from the presigned URL surfaces as a typed exception."""
     responses.add(

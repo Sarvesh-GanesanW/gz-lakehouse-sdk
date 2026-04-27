@@ -171,17 +171,18 @@ class Transport:
         self,
         session_id: str,
         sql: str,
-        target_chunks: int | None = None,
     ) -> TransportResult:
         """Submit ``sql`` on ``session_id`` and materialise the result.
 
         The session must already be alive (created via
         :meth:`start_session`). The provider forwards the statement to
         the session pod's warm Spark cluster, then returns presigned
-        chunk URLs which we download in parallel.
+        chunk URLs which we download in parallel. Chunk count is
+        determined server-side from result size — there is no
+        per-call chunking knob.
         """
         submit_started = time.monotonic()
-        envelope = self._submit(session_id, sql, target_chunks)
+        envelope = self._submit(session_id, sql)
         submit_seconds = time.monotonic() - submit_started
 
         compressed_bytes = sum(
@@ -245,7 +246,6 @@ class Transport:
         session_id: str,
         sql: str,
         batch_size: int = 65_536,
-        target_chunks: int | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result chunk-by-chunk as :class:`pyarrow.RecordBatch`.
 
@@ -255,7 +255,7 @@ class Transport:
         Memory stays bounded to roughly ``parallel_workers`` chunks at
         any moment.
         """
-        envelope = self._submit(session_id, sql, target_chunks)
+        envelope = self._submit(session_id, sql)
         if not envelope.chunks:
             return
 
@@ -377,7 +377,6 @@ class Transport:
         self,
         session_id: str,
         sql: str,
-        target_chunks: int | None,
     ) -> _Envelope:
         """POST the SQL on ``session_id`` and parse the chunk envelope."""
         payload: dict[str, Any] = {
@@ -391,8 +390,6 @@ class Transport:
             },
             "query": sql,
         }
-        if target_chunks is not None:
-            payload["targetChunks"] = target_chunks
         response = self._http.post(
             path=_STATEMENTS_PATH,
             json_body=payload,
