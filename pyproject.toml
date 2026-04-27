@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gz-lakehouse"
+description = "Python SDK for GroundZero Lakehouse — query Iceberg tables over HTTPS."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "GroundZero" }]
+keywords = ["groundzero", "lakehouse", "iceberg", "sdk", "data"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+]
+dynamic = ["version"]
+dependencies = [
+    "requests>=2.31,<3",
+    "urllib3>=1.26,<3",
+    "pyarrow>=14.0,<20",
+    "orjson>=3.9,<4",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+spark = ["pyspark>=3.3"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "responses>=0.24",
+    "ruff>=0.5",
+    "pandas>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/groundzero/gz-lakehouse-sdk"
+Issues = "https://github.com/groundzero/gz-lakehouse-sdk/issues"
+
+[tool.hatch.version]
+path = "src/gz_lakehouse/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gz_lakehouse"]
+
+[tool.ruff]
+line-length = 79
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "PL", "RET", "SIM"]
+ignore = [
+    "PLR0913",
+    "PLR2004",
+    "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
