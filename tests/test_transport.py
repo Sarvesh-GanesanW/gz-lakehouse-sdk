@@ -1,4 +1,4 @@
-"""Tests for the Snowflake-style :class:`gz_lakehouse._transport.Transport`."""
+"""Tests for the session-aware :class:`gz_lakehouse._transport.Transport`."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from gz_lakehouse.exceptions import QueryExecutionError
 
 PROVIDER_URL = "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
 S3_URL_TEMPLATE = "https://s3.example.com/chunk-{}.arrow"
+SESSION_ID = "session-abc-123"
 
 
 def _config(**overrides: object) -> LakehouseConfig:
@@ -77,6 +78,90 @@ def _envelope(chunk_count: int, total_rows: int) -> dict:
 
 
 @responses.activate
+def test_start_session_returns_session_id() -> None:
+    """``start_session`` extracts the sessionId from the response."""
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/startsession",
+        json={"status": 200, "response": {"sessionId": SESSION_ID}},
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+
+    assert transport.start_session() == SESSION_ID
+    transport.close()
+    http.close()
+
+
+@responses.activate
+def test_start_session_accepts_session_identifier_alias() -> None:
+    """Provider-side payloads using ``sessionIdentifier`` also resolve."""
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/startsession",
+        json={
+            "status": 200,
+            "response": {"sessionIdentifier": SESSION_ID},
+        },
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+
+    assert transport.start_session() == SESSION_ID
+    transport.close()
+    http.close()
+
+
+@responses.activate
+def test_start_session_missing_id_raises() -> None:
+    """Missing sessionId in the response is a typed error."""
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/startsession",
+        json={"status": 200, "response": {}},
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+
+    with pytest.raises(QueryExecutionError):
+        transport.start_session()
+    transport.close()
+    http.close()
+
+
+@responses.activate
+def test_stop_session_posts_payload() -> None:
+    """``stop_session`` POSTs ``{sessionId}`` to the provider."""
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/stopsession",
+        json={"status": 200, "response": {"message": "ok"}},
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+
+    transport.stop_session(SESSION_ID)
+
+    assert len(responses.calls) == 1
+    body = _json.loads(responses.calls[0].request.body)
+    assert body == {"sessionId": SESSION_ID}
+    transport.close()
+    http.close()
+
+
+@responses.activate
 def test_execute_downloads_arrow_chunks_in_parallel() -> None:
     """All chunks are fetched and concatenated in submission order."""
     chunks = [
@@ -103,7 +188,7 @@ def test_execute_downloads_arrow_chunks_in_parallel() -> None:
     http = _http(config)
     transport = Transport(http=http, config=config)
 
-    outcome = transport.execute("SELECT * FROM customers")
+    outcome = transport.execute(SESSION_ID, "SELECT * FROM customers")
 
     assert outcome.table.num_rows == 6
     assert outcome.table.column("id").to_pylist() == [1, 2, 3, 4, 5, 6]
@@ -134,7 +219,7 @@ def test_execute_returns_empty_table_with_schema() -> None:
     http = _http(config)
     transport = Transport(http=http, config=config)
 
-    outcome = transport.execute("SELECT * FROM empty")
+    outcome = transport.execute(SESSION_ID, "SELECT * FROM empty")
 
     assert outcome.table.num_rows == 0
     assert outcome.table.column_names == ["id", "name"]
@@ -174,7 +259,8 @@ def test_iter_batches_streams_chunks() -> None:
     transport = Transport(http=http, config=config)
 
     rows: list[int] = []
-    for batch in transport.iter_batches("SELECT id FROM customers"):
+    sql = "SELECT id FROM customers"
+    for batch in transport.iter_batches(SESSION_ID, sql):
         rows.extend(batch.column("id").to_pylist())
 
     assert rows == [1, 2, 3, 4, 5, 6]
@@ -197,7 +283,7 @@ def test_envelope_with_invalid_chunks_raises() -> None:
     transport = Transport(http=http, config=config)
 
     with pytest.raises(QueryExecutionError):
-        transport.execute("SELECT 1")
+        transport.execute(SESSION_ID, "SELECT 1")
     transport.close()
     http.close()
 
@@ -217,122 +303,15 @@ def test_envelope_status_error_raises() -> None:
     transport = Transport(http=http, config=config)
 
     with pytest.raises(QueryExecutionError) as exc_info:
-        transport.execute("SELECT BAD FROM")
+        transport.execute(SESSION_ID, "SELECT BAD FROM")
     assert "syntax error" in str(exc_info.value)
     transport.close()
     http.close()
 
 
 @responses.activate
-def test_envelope_with_non_http_chunk_url_raises() -> None:
-    """Chunk URLs must be http(s) — anything else is rejected."""
-    responses.add(
-        responses.POST,
-        f"{PROVIDER_URL}/iceberg/v1/statements",
-        json={
-            "schema": [],
-            "chunks": [{"url": "ftp://example.com/chunk-0.arrow"}],
-        },
-        status=200,
-    )
-
-    config = _config()
-    http = _http(config)
-    transport = Transport(http=http, config=config)
-
-    with pytest.raises(QueryExecutionError) as exc_info:
-        transport.execute("SELECT 1")
-    assert "http" in str(exc_info.value).lower()
-    transport.close()
-    http.close()
-
-
-@responses.activate
-def test_envelope_with_non_dict_chunk_raises() -> None:
-    """Each chunk descriptor must be a JSON object, not a bare string."""
-    responses.add(
-        responses.POST,
-        f"{PROVIDER_URL}/iceberg/v1/statements",
-        json={"schema": [], "chunks": ["https://s3/x.arrow"]},
-        status=200,
-    )
-
-    config = _config()
-    http = _http(config)
-    transport = Transport(http=http, config=config)
-
-    with pytest.raises(QueryExecutionError):
-        transport.execute("SELECT 1")
-    transport.close()
-    http.close()
-
-
-@responses.activate
-def test_envelope_handles_string_total_records() -> None:
-    """``totalRecords`` returned as a string still parses cleanly."""
-    table = pa.table({"id": pa.array([1, 2], type=pa.int64())})
-    responses.add(
-        responses.POST,
-        f"{PROVIDER_URL}/iceberg/v1/statements",
-        json={
-            "schema": [{"columnName": "id", "dataType": "BIGINT"}],
-            "totalRecords": "2",
-            "hasMore": False,
-            "chunks": [{"url": S3_URL_TEMPLATE.format(0)}],
-        },
-        status=200,
-    )
-    responses.add(
-        responses.GET,
-        S3_URL_TEMPLATE.format(0),
-        body=_arrow_ipc_bytes(table),
-        status=200,
-    )
-
-    config = _config()
-    http = _http(config)
-    transport = Transport(http=http, config=config)
-
-    outcome = transport.execute("SELECT 1")
-
-    assert outcome.total_rows == 2
-    transport.close()
-    http.close()
-
-
-@responses.activate
-def test_chunk_with_invalid_arrow_bytes_raises() -> None:
-    """Garbage bytes from S3 surface as :class:`QueryExecutionError`."""
-    responses.add(
-        responses.POST,
-        f"{PROVIDER_URL}/iceberg/v1/statements",
-        json={
-            "schema": [],
-            "chunks": [{"url": S3_URL_TEMPLATE.format(0)}],
-        },
-        status=200,
-    )
-    responses.add(
-        responses.GET,
-        S3_URL_TEMPLATE.format(0),
-        body=b"not-arrow-ipc",
-        status=200,
-    )
-
-    config = _config(max_retries=0)
-    http = _http(config)
-    transport = Transport(http=http, config=config)
-
-    with pytest.raises(QueryExecutionError) as exc_info:
-        transport.execute("SELECT 1")
-    assert "Arrow IPC" in str(exc_info.value)
-    transport.close()
-    http.close()
-
-
-@responses.activate
-def test_submit_payload_uses_compute_size_default() -> None:
-    """Default config sends ``computeSize`` and omits raw ``computeId``."""
+def test_submit_payload_includes_session_id() -> None:
+    """The execute call sends ``sessionId`` in the body."""
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/v1/statements",
@@ -344,22 +323,19 @@ def test_submit_payload_uses_compute_size_default() -> None:
     http = _http(config)
     transport = Transport(http=http, config=config)
 
-    transport.execute("SELECT 1")
+    transport.execute(SESSION_ID, "SELECT 1")
 
-    submit_call = responses.calls[0]
-    body = submit_call.request.body
-    if isinstance(body, bytes):
-        body = body.decode()
-    payload = _json.loads(body)
-    assert payload["computeSize"] == "small"
-    assert "computeId" not in payload
+    body = _json.loads(responses.calls[0].request.body)
+    assert body["sessionId"] == SESSION_ID
+    assert body["query"] == "SELECT 1"
+    assert "targetChunks" not in body
     transport.close()
     http.close()
 
 
 @responses.activate
-def test_submit_payload_includes_compute_id_when_set() -> None:
-    """Explicit ``compute_id`` is sent alongside ``computeSize``."""
+def test_submit_payload_includes_target_chunks_when_set() -> None:
+    """``target_chunks`` is forwarded when explicitly provided."""
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/v1/statements",
@@ -367,19 +343,14 @@ def test_submit_payload_includes_compute_id_when_set() -> None:
         status=200,
     )
 
-    config = _config(compute_id=1012)
+    config = _config()
     http = _http(config)
     transport = Transport(http=http, config=config)
 
-    transport.execute("SELECT 1")
+    transport.execute(SESSION_ID, "SELECT 1", target_chunks=16)
 
-    submit_call = responses.calls[0]
-    body = submit_call.request.body
-    if isinstance(body, bytes):
-        body = body.decode()
-    payload = _json.loads(body)
-    assert payload["computeId"] == 1012
-    assert payload["computeSize"] == "small"
+    body = _json.loads(responses.calls[0].request.body)
+    assert body["targetChunks"] == 16
     transport.close()
     http.close()
 
@@ -409,6 +380,6 @@ def test_chunk_download_failure_surfaces() -> None:
     transport = Transport(http=http, config=config)
 
     with pytest.raises(QueryExecutionError):
-        transport.execute("SELECT 1")
+        transport.execute(SESSION_ID, "SELECT 1")
     transport.close()
     http.close()

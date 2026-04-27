@@ -12,10 +12,12 @@ from gz_lakehouse import (
     LakehouseClient,
     LakehouseConfig,
     QueryError,
+    Session,
 )
 
 PROVIDER_URL = "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
 S3_URL_TEMPLATE = "https://s3.example.com/chunk-{}.arrow"
+SESSION_ID = "session-test-1"
 
 
 def _config(**overrides: object) -> LakehouseConfig:
@@ -39,12 +41,24 @@ def _arrow_ipc_bytes(table: pa.Table) -> bytes:
     return sink.getvalue()
 
 
-def _add_verify_response() -> None:
-    """Register the testconnection mock used by every test."""
+def _stub_session_lifecycle() -> None:
+    """Register testconnection + start/stop session mocks."""
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/testconnection",
         json={"message": "ok"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/startsession",
+        json={"status": 200, "response": {"sessionId": SESSION_ID}},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/stopsession",
+        json={"status": 200, "response": {"message": "ok"}},
         status=200,
     )
 
@@ -52,7 +66,7 @@ def _add_verify_response() -> None:
 @responses.activate
 def test_query_returns_pyarrow_table() -> None:
     """A successful execution materialises into a pyarrow Table."""
-    _add_verify_response()
+    _stub_session_lifecycle()
     table = pa.table({"id": [1], "name": ["alice"]})
     responses.add(
         responses.POST,
@@ -88,7 +102,7 @@ def test_query_returns_pyarrow_table() -> None:
 @responses.activate
 def test_query_preserves_schema_for_empty_result() -> None:
     """Zero-chunk results still expose the column metadata."""
-    _add_verify_response()
+    _stub_session_lifecycle()
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/v1/statements",
@@ -129,8 +143,8 @@ def test_authentication_failure_raises() -> None:
 
 @responses.activate
 def test_query_error_raises() -> None:
-    """An ``error`` envelope surfaces as :class:`QueryError`."""
-    _add_verify_response()
+    """An error envelope surfaces as :class:`QueryError`."""
+    _stub_session_lifecycle()
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/v1/statements",
@@ -145,7 +159,7 @@ def test_query_error_raises() -> None:
 @responses.activate
 def test_iter_batches_streams_results() -> None:
     """``iter_batches`` yields record batches across multiple chunks."""
-    _add_verify_response()
+    _stub_session_lifecycle()
     chunks = [
         pa.table({"id": pa.array([1, 2], type=pa.int64())}),
         pa.table({"id": pa.array([3, 4], type=pa.int64())}),
@@ -180,7 +194,7 @@ def test_iter_batches_streams_results() -> None:
 @responses.activate
 def test_query_parallel_concatenates_partitions() -> None:
     """``query_parallel`` fans out range-partitioned subqueries."""
-    _add_verify_response()
+    _stub_session_lifecycle()
     for value in (1, 2, 3):
         responses.add(
             responses.POST,
@@ -212,3 +226,58 @@ def test_query_parallel_concatenates_partitions() -> None:
 
     assert result.total_rows == 3
     assert sorted(row["id"] for row in result.to_list()) == [1, 2, 3]
+
+
+@responses.activate
+def test_start_session_returns_session() -> None:
+    """``start_session`` returns a ``Session`` bound to the sessionId."""
+    _stub_session_lifecycle()
+
+    with LakehouseClient(_config()) as client:
+        session = client.start_session()
+        try:
+            assert isinstance(session, Session)
+            assert session.session_id == SESSION_ID
+            assert session.closed is False
+        finally:
+            session.stop()
+        assert session.closed is True
+
+
+@responses.activate
+def test_session_runs_multiple_queries_on_one_pod() -> None:
+    """A user-managed session reuses the pod across calls."""
+    _stub_session_lifecycle()
+    for value in (10, 20):
+        responses.add(
+            responses.POST,
+            f"{PROVIDER_URL}/iceberg/v1/statements",
+            json={
+                "schema": [{"columnName": "x", "dataType": "BIGINT"}],
+                "totalRecords": 1,
+                "hasMore": False,
+                "chunks": [{"url": S3_URL_TEMPLATE.format(value)}],
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            S3_URL_TEMPLATE.format(value),
+            body=_arrow_ipc_bytes(
+                pa.table({"x": pa.array([value], type=pa.int64())})
+            ),
+            status=200,
+        )
+
+    with LakehouseClient(_config()) as client, client.start_session() as s:
+        first = s.query("SELECT 10 AS x")
+        second = s.query("SELECT 20 AS x")
+
+    assert first.to_list() == [{"x": 10}]
+    assert second.to_list() == [{"x": 20}]
+    start_calls = [
+        c
+        for c in responses.calls
+        if c.request.url.endswith("/iceberg/startsession")
+    ]
+    assert len(start_calls) == 1

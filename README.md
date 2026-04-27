@@ -2,7 +2,7 @@
 
 Plug-and-play Python SDK for the GroundZero Lakehouse — query Iceberg tables over HTTPS from any Python environment, no Spark or JDBC required.
 
-`0.2.0` ships a Snowflake-style data plane: the provider hands the client a list of presigned S3 URLs to Arrow IPC chunks, and the client downloads them in parallel. Throughput scales linearly with worker count up to the network ceiling.
+`0.3.0` introduces an explicit **session API** — start a warm compute pod once, run many statements against it, stop when done. The data plane stays Snowflake-style: the provider hands back presigned S3 URLs to Arrow IPC chunks, and the client downloads them in parallel.
 
 ## Install
 
@@ -24,10 +24,18 @@ with LakehouseClient.from_kwargs(
     username="user@example.com",
     password="****",
 ) as client:
-    result = client.query("SELECT * FROM sales.orders LIMIT 1000")
-    df = result.to_pandas()
-    arrow_table = result.to_arrow()
-    rows = result.to_list()
+
+    # Recommended: explicit session, reuses the warm pod across queries.
+    with client.start_session() as session:
+        df = session.query("SELECT * FROM sales.orders LIMIT 1000").to_pandas()
+        arrow = session.query("SELECT * FROM customers LIMIT 50").to_arrow()
+        for batch in session.iter_batches(
+            "SELECT * FROM sales.orders WHERE year = 2025",
+        ):
+            ...
+
+    # One-off convenience: auto-creates and stops a session per call.
+    df = client.query("SELECT count(*) FROM sales.orders").to_pandas()
 ```
 
 Or pull credentials from the environment:
@@ -40,17 +48,27 @@ os.environ["GZ_LAKEHOUSE_DATABASE"] = "..."
 os.environ["GZ_LAKEHOUSE_USERNAME"] = "..."
 os.environ["GZ_LAKEHOUSE_PASSWORD"] = "..."
 
-with LakehouseClient.from_env() as client:
-    result = client.query("SELECT count(*) FROM sales.orders")
+with LakehouseClient.from_env() as client, client.start_session() as session:
+    result = session.query("SELECT count(*) FROM sales.orders")
 ```
 
 The client picks `gz-site` automatically from the URL host (the second hyphen-segment of the first label, i.e. `<env>-<site>-<service>` → `<site>`) and verifies the provider on the first call. The password is redacted from `repr(config)` so it never leaks into stack traces or logs.
+
+### Session vs. one-off
+
+| Mode | Cost | When to use |
+|---|---|---|
+| `with client.start_session() as session: ...` | Pod boot once (~17 s), every query after that is fast | Notebooks, ETL with many statements, anything interactive |
+| `client.query(sql)` | Pod boot **per call** | One-off scripts, smoke tests, stateless workers |
+
+Sessions are explicit so the cost is visible; the convenience wrappers exist so plug-and-play users don't have to think about it.
 
 ## Public API
 
 | Symbol                 | Purpose                                                                   |
 | ---------------------- | ------------------------------------------------------------------------- |
-| `LakehouseClient`      | Connect, verify, run queries, stream batches, fan out partitioned queries |
+| `LakehouseClient`      | Connect, verify, start sessions, plus one-off convenience wrappers        |
+| `Session`              | Warm compute pod; run queries, stream batches, fan-out partitioned queries |
 | `LakehouseConfig`      | Frozen dataclass for connection params + perf knobs                       |
 | `QueryResult`          | Wraps an Arrow table + schema; converts to pandas / Spark / list          |
 | `GzLakehouseError`     | Base exception                                                            |

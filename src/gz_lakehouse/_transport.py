@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     from gz_lakehouse.config import LakehouseConfig
 
 _STATEMENTS_PATH = "/iceberg/v1/statements"
+_START_SESSION_PATH = "/iceberg/startsession"
+_STOP_SESSION_PATH = "/iceberg/stopsession"
 _VERIFY_PATH = "/iceberg/testconnection"
 
 _DOWNLOAD_BUFFER_BYTES = 1 << 20
@@ -125,9 +127,20 @@ class Transport:
         self._config = config
         self._s3_session = self._build_s3_session()
 
-    def execute(self, sql: str) -> TransportResult:
-        """Submit ``sql`` and materialise the full result as an Arrow table."""
-        envelope = self._submit(sql)
+    def execute(
+        self,
+        session_id: str,
+        sql: str,
+        target_chunks: int | None = None,
+    ) -> TransportResult:
+        """Submit ``sql`` on ``session_id`` and materialise the result.
+
+        The session must already be alive (created via
+        :meth:`start_session`). The provider forwards the statement to
+        the session pod's warm Spark cluster, then returns presigned
+        chunk URLs which we download in parallel.
+        """
+        envelope = self._submit(session_id, sql, target_chunks)
         if not envelope.chunks:
             return TransportResult(
                 table=empty_table_for(envelope.schema),
@@ -163,8 +176,10 @@ class Transport:
 
     def iter_batches(
         self,
+        session_id: str,
         sql: str,
         batch_size: int = 65_536,
+        target_chunks: int | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result chunk-by-chunk as :class:`pyarrow.RecordBatch`.
 
@@ -174,7 +189,7 @@ class Transport:
         Memory stays bounded to roughly ``parallel_workers`` chunks at
         any moment.
         """
-        envelope = self._submit(sql)
+        envelope = self._submit(session_id, sql, target_chunks)
         if not envelope.chunks:
             return
 
@@ -187,6 +202,69 @@ class Transport:
             for future in futures:
                 table = future.result()
                 yield from table.to_batches(max_chunksize=batch_size)
+
+    def start_session(self) -> str:
+        """Create a warm compute session and return its sessionId.
+
+        The session pod boots with the configured ``compute_size``
+        (and optional ``compute_id`` escape hatch) and remains alive
+        until :meth:`stop_session` is called. Spark workers register
+        with the master during this call's wait — by the time it
+        returns the cluster is ready for statement execution.
+        """
+        payload: dict[str, Any] = {
+            "computeSize": self._config.compute_size,
+            "connectionConfig": {
+                "config": {
+                    "userName": self._config.username,
+                    "password": self._config.password,
+                    "warehouseName": self._config.warehouse,
+                    "databaseName": self._config.database,
+                },
+            },
+        }
+        if self._config.compute_id is not None:
+            payload["computeId"] = self._config.compute_id
+        response = self._http.post(
+            path=_START_SESSION_PATH,
+            json_body=payload,
+            timeout_seconds=self._config.verify_timeout_seconds,
+        )
+        try:
+            body = response.json()
+        finally:
+            response.close()
+        return self._extract_session_id(body)
+
+    def stop_session(self, session_id: str) -> None:
+        """Tear down the session pod created by :meth:`start_session`."""
+        response = self._http.post(
+            path=_STOP_SESSION_PATH,
+            json_body={"sessionId": session_id},
+            timeout_seconds=self._config.verify_timeout_seconds,
+        )
+        response.close()
+
+    @staticmethod
+    def _extract_session_id(body: Any) -> str:
+        """Pull the sessionId out of the start-session envelope."""
+        if not isinstance(body, dict):
+            raise QueryExecutionError(
+                "start_session response must be a JSON object"
+            )
+        response = body.get("response")
+        candidate = None
+        if isinstance(response, dict):
+            candidate = response.get("sessionId") or response.get(
+                "sessionIdentifier"
+            )
+        if not candidate and isinstance(body.get("sessionId"), str):
+            candidate = body["sessionId"]
+        if not isinstance(candidate, str) or not candidate:
+            raise QueryExecutionError(
+                "start_session response did not include a sessionId"
+            )
+        return candidate
 
     def verify(self) -> None:
         """Verify connectivity and credentials against the provider.
@@ -215,10 +293,15 @@ class Transport:
         """Release the dedicated S3 session pool."""
         self._s3_session.close()
 
-    def _submit(self, sql: str) -> _Envelope:
-        """POST the SQL and return the parsed chunk envelope."""
+    def _submit(
+        self,
+        session_id: str,
+        sql: str,
+        target_chunks: int | None,
+    ) -> _Envelope:
+        """POST the SQL on ``session_id`` and parse the chunk envelope."""
         payload: dict[str, Any] = {
-            "computeSize": self._config.compute_size,
+            "sessionId": session_id,
             "connectionConfig": {
                 "config": {
                     "userName": self._config.username,
@@ -228,8 +311,8 @@ class Transport:
             },
             "query": sql,
         }
-        if self._config.compute_id is not None:
-            payload["computeId"] = self._config.compute_id
+        if target_chunks is not None:
+            payload["targetChunks"] = target_chunks
         response = self._http.post(
             path=_STATEMENTS_PATH,
             json_body=payload,

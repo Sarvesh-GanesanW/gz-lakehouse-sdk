@@ -20,6 +20,7 @@ from gz_lakehouse.exceptions import (
     TransportError,
 )
 from gz_lakehouse.result import QueryResult
+from gz_lakehouse.session import Session
 
 __all__ = [
     "AuthenticationError",
@@ -32,6 +33,7 @@ __all__ = [
     "QueryExecutionError",
     "QueryResult",
     "QueryValidationError",
+    "Session",
     "TransportError",
     "__version__",
 ]
