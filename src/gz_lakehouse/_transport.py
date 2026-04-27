@@ -72,6 +72,14 @@ _DOWNLOAD_BUFFER_BYTES = 1 << 20
 
 _S3_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
+_COMPUTE_SIZE_TO_ID: dict[str, int] = {
+    "small": 1003,
+    "medium": 1006,
+    "large": 1009,
+    "xlarge": 1012,
+    "2xlarge": 1015,
+}
+
 _logger = get_logger("transport")
 
 
@@ -207,24 +215,22 @@ class Transport:
         """Create a warm compute session and return its sessionId.
 
         The session pod boots with the configured ``compute_size``
-        (and optional ``compute_id`` escape hatch) and remains alive
-        until :meth:`stop_session` is called. Spark workers register
-        with the master during this call's wait — by the time it
-        returns the cluster is ready for statement execution.
+        (resolved to a concrete ``computeId`` server-side identifier
+        on the wire) and remains alive until :meth:`stop_session` is
+        called. Spark workers register with the master during the
+        provider's wait — by the time this call returns the cluster
+        is ready for statement execution.
         """
+        compute_id = self._resolve_compute_id()
         payload: dict[str, Any] = {
-            "computeSize": self._config.compute_size,
+            "computeId": compute_id,
+            "minimumWorkers": 1,
             "connectionConfig": {
-                "config": {
-                    "userName": self._config.username,
-                    "password": self._config.password,
-                    "warehouseName": self._config.warehouse,
-                    "databaseName": self._config.database,
-                },
+                "userName": self._config.username,
+                "warehouseName": self._config.warehouse,
+                "databaseName": self._config.database,
             },
         }
-        if self._config.compute_id is not None:
-            payload["computeId"] = self._config.compute_id
         response = self._http.post(
             path=_START_SESSION_PATH,
             json_body=payload,
@@ -235,6 +241,22 @@ class Transport:
         finally:
             response.close()
         return self._extract_session_id(body)
+
+    def _resolve_compute_id(self) -> int:
+        """Resolve the configured t-shirt size to a server compute id.
+
+        ``LakehouseConfig.compute_id`` overrides the t-shirt mapping
+        when set explicitly (escape hatch for non-standard ids).
+        """
+        if self._config.compute_id is not None:
+            return self._config.compute_id
+        try:
+            return _COMPUTE_SIZE_TO_ID[self._config.compute_size]
+        except KeyError as ex:
+            raise QueryExecutionError(
+                f"Unknown compute_size {self._config.compute_size!r}; "
+                f"set compute_id explicitly to use a custom value",
+            ) from ex
 
     def stop_session(self, session_id: str) -> None:
         """Tear down the session pod created by :meth:`start_session`."""
