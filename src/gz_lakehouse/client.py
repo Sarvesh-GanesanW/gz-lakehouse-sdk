@@ -21,7 +21,7 @@ import pyarrow as pa
 
 from gz_lakehouse._http import HttpClient
 from gz_lakehouse._logging import get_logger
-from gz_lakehouse._transport import Transport
+from gz_lakehouse._transport import ExecutorChoice, Transport
 from gz_lakehouse.config import LakehouseConfig
 from gz_lakehouse.exceptions import ConfigurationError
 from gz_lakehouse.result import QueryResult
@@ -114,31 +114,35 @@ class LakehouseClient:
     def query(
         self,
         sql: str,
+        executor: ExecutorChoice = "auto",
     ) -> QueryResult:
         """Convenience: create a session, run ``sql``, stop the session.
 
         Pays the full session-start cost on every call. For repeated
         work, prefer :meth:`start_session` so the cost is amortised.
+        ``executor`` is forwarded to :meth:`Session.query`.
         """
         with self.start_session() as session:
-            return session.query(sql)
+            return session.query(sql, executor=executor)
 
     def iter_batches(
         self,
         sql: str,
         batch_size: int = 65_536,
+        executor: ExecutorChoice = "auto",
     ) -> Iterator[pa.RecordBatch]:
         """Convenience-streaming wrapper.
 
         Memory-bound but pays the full session-start cost. The
         underlying session is held open until the iterator is fully
-        consumed, then stopped.
+        consumed, then stopped. ``executor`` is forwarded.
         """
         session = self.start_session()
         try:
             yield from session.iter_batches(
                 sql,
                 batch_size=batch_size,
+                executor=executor,
             )
         finally:
             session.stop()

@@ -41,7 +41,11 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
+
+
+ExecutorChoice = Literal["auto", "fast", "spark"]
+_VALID_EXECUTORS = ("auto", "fast", "spark")
 
 import pyarrow as pa
 import pyarrow.ipc as paipc
@@ -171,6 +175,7 @@ class Transport:
         self,
         session_id: str,
         sql: str,
+        executor: ExecutorChoice = "auto",
     ) -> TransportResult:
         """Submit ``sql`` on ``session_id`` and materialise the result.
 
@@ -180,9 +185,20 @@ class Transport:
         chunk URLs which we download in parallel. Chunk count is
         determined server-side from result size — there is no
         per-call chunking knob.
+
+        ``executor`` overrides the server-side routing decision:
+
+        * ``"auto"`` (default): server picks fast path for simple
+          single-table SELECTs, Spark for everything else.
+        * ``"fast"``: force the PyIceberg fast path. Server returns
+          an error if the query shape is not eligible.
+        * ``"spark"``: skip fast-path detection entirely and route
+          straight to the Spark engine. Useful to compare paths or
+          to dodge a fast-path bug without touching the SDK.
         """
+        _validate_executor(executor)
         submit_started = time.monotonic()
-        envelope = self._submit(session_id, sql)
+        envelope = self._submit(session_id, sql, executor=executor)
         submit_seconds = time.monotonic() - submit_started
 
         compressed_bytes = sum(
@@ -246,6 +262,7 @@ class Transport:
         session_id: str,
         sql: str,
         batch_size: int = 65_536,
+        executor: ExecutorChoice = "auto",
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result chunk-by-chunk as :class:`pyarrow.RecordBatch`.
 
@@ -253,9 +270,11 @@ class Transport:
         ``parallel_workers`` in flight; results are yielded in
         submission order so the caller always sees a stable row order.
         Memory stays bounded to roughly ``parallel_workers`` chunks at
-        any moment.
+        any moment. ``executor`` has the same meaning as on
+        :meth:`execute`.
         """
-        envelope = self._submit(session_id, sql)
+        _validate_executor(executor)
+        envelope = self._submit(session_id, sql, executor=executor)
         if not envelope.chunks:
             return
 
@@ -377,6 +396,7 @@ class Transport:
         self,
         session_id: str,
         sql: str,
+        executor: ExecutorChoice = "auto",
     ) -> _Envelope:
         """POST the SQL on ``session_id`` and parse the chunk envelope."""
         payload: dict[str, Any] = {
@@ -390,6 +410,8 @@ class Transport:
             },
             "query": sql,
         }
+        if executor != "auto":
+            payload["executor"] = executor
         response = self._http.post(
             path=_STATEMENTS_PATH,
             json_body=payload,
@@ -548,6 +570,19 @@ class Transport:
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
+
+
+def _validate_executor(executor: str) -> None:
+    """Reject anything outside ``ExecutorChoice``.
+
+    Caught in the transport before the request goes out so the user
+    sees the typo (``"fastpath"`` instead of ``"fast"``) immediately
+    rather than as a server-side rejection seconds later.
+    """
+    if executor not in _VALID_EXECUTORS:
+        raise QueryExecutionError(
+            f"executor must be one of {_VALID_EXECUTORS!r}; got {executor!r}",
+        )
 
 
 def _safe_int(value: Any, default: int) -> int:

@@ -36,7 +36,7 @@ from gz_lakehouse.exceptions import QueryValidationError
 from gz_lakehouse.result import QueryResult
 
 if TYPE_CHECKING:
-    from gz_lakehouse._transport import Transport
+    from gz_lakehouse._transport import ExecutorChoice, Transport
     from gz_lakehouse.config import LakehouseConfig
 
 _logger = get_logger("session")
@@ -78,13 +78,22 @@ class Session:
     def query(
         self,
         sql: str,
+        executor: ExecutorChoice = "auto",
     ) -> QueryResult:
-        """Execute ``sql`` and return the materialised :class:`QueryResult`."""
+        """Execute ``sql`` and return the materialised :class:`QueryResult`.
+
+        ``executor`` overrides server-side path selection. ``"auto"``
+        leaves it to the pod (PyIceberg fast path for simple SELECTs,
+        Spark for everything else). ``"fast"`` forces the fast path
+        and errors if not eligible. ``"spark"`` forces Spark even on
+        eligible queries — useful for A/B comparison.
+        """
         self._validate_sql(sql)
         self._ensure_open()
         outcome = self._transport.execute(
             self._session_id,
             sql,
+            executor=executor,
         )
         return QueryResult(
             table=outcome.table,
@@ -98,14 +107,19 @@ class Session:
         self,
         sql: str,
         batch_size: int = 65_536,
+        executor: ExecutorChoice = "auto",
     ) -> Iterator[pa.RecordBatch]:
-        """Stream the result of ``sql`` as :class:`pyarrow.RecordBatch`."""
+        """Stream the result of ``sql`` as :class:`pyarrow.RecordBatch`.
+
+        ``executor`` has the same meaning as on :meth:`query`.
+        """
         self._validate_sql(sql)
         self._ensure_open()
         return self._transport.iter_batches(
             self._session_id,
             sql,
             batch_size=batch_size,
+            executor=executor,
         )
 
     def query_parallel(

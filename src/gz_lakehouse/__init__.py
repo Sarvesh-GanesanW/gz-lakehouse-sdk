@@ -6,6 +6,7 @@ hierarchy. Internal modules (``_http``, ``_transport``, ``_arrow_build``,
 ``_logging``, ``_version``) are not re-exported.
 """
 
+from gz_lakehouse._transport import ExecutorChoice
 from gz_lakehouse._version import __version__
 from gz_lakehouse.client import LakehouseClient
 from gz_lakehouse.config import LakehouseConfig
@@ -26,6 +27,7 @@ __all__ = [
     "AuthenticationError",
     "AuthorizationError",
     "ConfigurationError",
+    "ExecutorChoice",
     "GzLakehouseError",
     "LakehouseClient",
     "LakehouseConfig",
