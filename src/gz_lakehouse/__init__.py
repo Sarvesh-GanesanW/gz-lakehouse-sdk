@@ -20,6 +20,7 @@ from gz_lakehouse.exceptions import (
     QueryValidationError,
     TransportError,
 )
+from gz_lakehouse.pipeline_config import PipelineConfig
 from gz_lakehouse.result import QueryResult
 from gz_lakehouse.session import Session
 
@@ -31,6 +32,7 @@ __all__ = [
     "GzLakehouseError",
     "LakehouseClient",
     "LakehouseConfig",
+    "PipelineConfig",
     "QueryError",
     "QueryExecutionError",
     "QueryResult",

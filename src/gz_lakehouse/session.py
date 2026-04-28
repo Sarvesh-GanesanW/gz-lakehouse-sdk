@@ -38,6 +38,7 @@ from gz_lakehouse.result import QueryResult
 if TYPE_CHECKING:
     from gz_lakehouse._transport import ExecutorChoice, Transport
     from gz_lakehouse.config import LakehouseConfig
+    from gz_lakehouse.pipeline_config import PipelineConfig
 
 _logger = get_logger("session")
 
@@ -79,6 +80,7 @@ class Session:
         self,
         sql: str,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> QueryResult:
         """Execute ``sql`` and return the materialised :class:`QueryResult`.
 
@@ -87,6 +89,13 @@ class Session:
         Spark for everything else). ``"fast"`` forces the fast path
         and errors if not eligible. ``"spark"`` forces Spark even on
         eligible queries — useful for A/B comparison.
+
+        ``pipeline`` is an optional :class:`PipelineConfig` that
+        tunes the fast-path pod-side pipeline (encoder count, upload
+        concurrency, batch sizing, compression level, etc.). Pass it
+        when you know the workload shape and want to override server
+        defaults — e.g. ``zstd_level=0`` for same-region clients,
+        ``num_encoders=12`` for a large pod.
         """
         self._validate_sql(sql)
         self._ensure_open()
@@ -94,6 +103,7 @@ class Session:
             self._session_id,
             sql,
             executor=executor,
+            pipeline=pipeline,
         )
         return QueryResult(
             table=outcome.table,
@@ -108,10 +118,12 @@ class Session:
         sql: str,
         batch_size: int = 65_536,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result of ``sql`` as :class:`pyarrow.RecordBatch`.
 
-        ``executor`` has the same meaning as on :meth:`query`.
+        ``executor`` and ``pipeline`` have the same meaning as on
+        :meth:`query`.
         """
         self._validate_sql(sql)
         self._ensure_open()
@@ -120,6 +132,7 @@ class Session:
             sql,
             batch_size=batch_size,
             executor=executor,
+            pipeline=pipeline,
         )
 
     def query_parallel(

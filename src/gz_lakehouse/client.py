@@ -24,6 +24,7 @@ from gz_lakehouse._logging import get_logger
 from gz_lakehouse._transport import ExecutorChoice, Transport
 from gz_lakehouse.config import LakehouseConfig
 from gz_lakehouse.exceptions import ConfigurationError
+from gz_lakehouse.pipeline_config import PipelineConfig
 from gz_lakehouse.result import QueryResult
 from gz_lakehouse.session import Session
 
@@ -115,27 +116,31 @@ class LakehouseClient:
         self,
         sql: str,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> QueryResult:
         """Convenience: create a session, run ``sql``, stop the session.
 
         Pays the full session-start cost on every call. For repeated
         work, prefer :meth:`start_session` so the cost is amortised.
-        ``executor`` is forwarded to :meth:`Session.query`.
+        ``executor`` and ``pipeline`` are forwarded to
+        :meth:`Session.query`.
         """
         with self.start_session() as session:
-            return session.query(sql, executor=executor)
+            return session.query(sql, executor=executor, pipeline=pipeline)
 
     def iter_batches(
         self,
         sql: str,
         batch_size: int = 65_536,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Convenience-streaming wrapper.
 
         Memory-bound but pays the full session-start cost. The
         underlying session is held open until the iterator is fully
-        consumed, then stopped. ``executor`` is forwarded.
+        consumed, then stopped. ``executor`` and ``pipeline`` are
+        forwarded.
         """
         session = self.start_session()
         try:
@@ -143,6 +148,7 @@ class LakehouseClient:
                 sql,
                 batch_size=batch_size,
                 executor=executor,
+                pipeline=pipeline,
             )
         finally:
             session.stop()

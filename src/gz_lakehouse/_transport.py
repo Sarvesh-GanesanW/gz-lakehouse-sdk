@@ -63,6 +63,7 @@ from gz_lakehouse.exceptions import (
     QueryExecutionError,
     TransportError,
 )
+from gz_lakehouse.pipeline_config import PipelineConfig
 
 if TYPE_CHECKING:
     from gz_lakehouse.config import LakehouseConfig
@@ -176,6 +177,7 @@ class Transport:
         session_id: str,
         sql: str,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> TransportResult:
         """Submit ``sql`` on ``session_id`` and materialise the result.
 
@@ -195,10 +197,17 @@ class Transport:
         * ``"spark"``: skip fast-path detection entirely and route
           straight to the Spark engine. Useful to compare paths or
           to dodge a fast-path bug without touching the SDK.
+
+        ``pipeline`` (optional :class:`PipelineConfig`) tunes the
+        fast-path pod-side pipeline (encoder count, upload concurrency,
+        batch sizing, compression level, etc.). Ignored when
+        ``executor`` resolves to Spark.
         """
         _validate_executor(executor)
         submit_started = time.monotonic()
-        envelope = self._submit(session_id, sql, executor=executor)
+        envelope = self._submit(
+            session_id, sql, executor=executor, pipeline=pipeline,
+        )
         submit_seconds = time.monotonic() - submit_started
 
         compressed_bytes = sum(
@@ -263,6 +272,7 @@ class Transport:
         sql: str,
         batch_size: int = 65_536,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result chunk-by-chunk as :class:`pyarrow.RecordBatch`.
 
@@ -270,11 +280,13 @@ class Transport:
         ``parallel_workers`` in flight; results are yielded in
         submission order so the caller always sees a stable row order.
         Memory stays bounded to roughly ``parallel_workers`` chunks at
-        any moment. ``executor`` has the same meaning as on
-        :meth:`execute`.
+        any moment. ``executor`` and ``pipeline`` have the same
+        meaning as on :meth:`execute`.
         """
         _validate_executor(executor)
-        envelope = self._submit(session_id, sql, executor=executor)
+        envelope = self._submit(
+            session_id, sql, executor=executor, pipeline=pipeline,
+        )
         if not envelope.chunks:
             return
 
@@ -397,6 +409,7 @@ class Transport:
         session_id: str,
         sql: str,
         executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
     ) -> _Envelope:
         """POST the SQL on ``session_id`` and parse the chunk envelope."""
         payload: dict[str, Any] = {
@@ -412,6 +425,10 @@ class Transport:
         }
         if executor != "auto":
             payload["executor"] = executor
+        if pipeline is not None:
+            wire = pipeline.to_wire()
+            if wire:
+                payload["pipelineConfig"] = wire
         response = self._http.post(
             path=_STATEMENTS_PATH,
             json_body=payload,
