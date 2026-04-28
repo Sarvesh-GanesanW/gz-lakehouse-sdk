@@ -38,6 +38,8 @@ typically lands in 2–3 seconds on a 1 Gb/s link.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import time
 from collections import deque
@@ -216,7 +218,14 @@ class Transport:
                 if etype == "schema":
                     schema = list(event.get("columns") or [])
                 elif etype == "chunk":
-                    pending.append(pool.submit(self._download_chunk, event))
+                    if "inline" in event:
+                        pending.append(
+                            pool.submit(self._decode_inline_chunk, event),
+                        )
+                    else:
+                        pending.append(
+                            pool.submit(self._download_chunk, event),
+                        )
                     compressed_bytes += int(event.get("compressedSize") or 0)
                     uncompressed_bytes += int(event.get("uncompressedSize") or 0)
                 elif etype == "heartbeat":
@@ -307,7 +316,14 @@ class Transport:
             for event in event_iter:
                 etype = event.get("type")
                 if etype == "chunk":
-                    pending.append(pool.submit(self._download_chunk, event))
+                    if "inline" in event:
+                        pending.append(
+                            pool.submit(self._decode_inline_chunk, event),
+                        )
+                    else:
+                        pending.append(
+                            pool.submit(self._download_chunk, event),
+                        )
                     while pending and pending[0].done():
                         table = pending.popleft().result()
                         yield from table.to_batches(max_chunksize=batch_size)
@@ -604,6 +620,41 @@ class Transport:
             total_rows=_safe_int(envelope.get("totalRecords"), default=0),
             truncated=bool(envelope.get("hasMore")),
         )
+
+    def _decode_inline_chunk(self, chunk: dict[str, Any]) -> pa.Table:
+        """Parse an inline chunk's base64-encoded Arrow IPC body.
+
+        Phase 3 inline chunks ship the IPC bytes embedded in the
+        NDJSON event itself, so the SDK can hand the first rows to
+        the caller without an S3 round trip. Pod emits at most one
+        inline chunk per query — the first batch flushed by whichever
+        encoder wins the race — keeping the wire payload small. All
+        subsequent chunks come via presigned URLs as before.
+        """
+        inline_b64 = chunk.get("inline") or ""
+        if not inline_b64:
+            raise QueryExecutionError(
+                "Inline chunk missing 'inline' payload",
+            )
+        try:
+            body = base64.b64decode(inline_b64)
+        except (ValueError, TypeError) as ex:
+            raise QueryExecutionError(
+                f"Inline chunk has malformed base64 payload: {ex}",
+            ) from ex
+        try:
+            reader = paipc.RecordBatchStreamReader(io.BytesIO(body))
+            table = reader.read_all()
+        except (pa.ArrowInvalid, pa.ArrowIOError) as ex:
+            raise QueryExecutionError(
+                f"Inline chunk is not a valid Arrow IPC stream: {ex}",
+            ) from ex
+        _logger.debug(
+            "inline chunk decoded rows=%s bytes=%s",
+            table.num_rows,
+            len(body),
+        )
+        return table
 
     def _download_chunk(self, chunk: dict[str, Any]) -> pa.Table:
         """Fetch a single presigned-URL chunk and parse its Arrow IPC stream.
