@@ -68,6 +68,14 @@ class PipelineConfig:
         chunk_bytes: Per-chunk uncompressed Arrow buffer threshold.
             Bigger chunks = fewer S3 PUTs but larger SDK download
             grain. Range 1 MB–1 GB.
+        inline_first_chunk: Phase 3 — ask the pod to embed the very
+            first chunk's IPC bytes directly in the NDJSON event
+            instead of going via S3. SDK decodes in place, saving
+            the first-chunk S3 PUT + presign + GET round trip
+            (~5-10 s on bench data). Default True for SDKs that
+            understand the inline event format. Server only emits
+            inline when this opt-in is present, so older SDKs are
+            unaffected.
     """
 
     num_encoders: int | None = None
@@ -78,6 +86,7 @@ class PipelineConfig:
     batch_readahead: int | None = None
     zstd_level: int | None = None
     chunk_bytes: int | None = None
+    inline_first_chunk: bool = True
 
     def __post_init__(self) -> None:
         """Validate ranges client-side so typos fail before the request."""
@@ -101,6 +110,8 @@ class PipelineConfig:
 
         Camel-case keys, only set fields included so the server can
         distinguish "caller didn't override" from "caller set to 0."
+        Boolean opt-ins (e.g. ``inline_first_chunk``) are always
+        emitted so the server can detect explicit ``False``.
         """
         out: dict[str, Any] = {}
         for field in fields(self):
@@ -132,4 +143,5 @@ _FIELD_TO_WIRE: dict[str, str] = {
     "batch_readahead": "batchReadahead",
     "zstd_level": "zstdLevel",
     "chunk_bytes": "chunkBytes",
+    "inline_first_chunk": "inlineFirstChunk",
 }
