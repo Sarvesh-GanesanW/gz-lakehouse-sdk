@@ -301,7 +301,7 @@ class Transport:
         compute_id = self._resolve_compute_id()
         payload: dict[str, Any] = {
             "computeId": compute_id,
-            "minimumWorkers": 1,
+            "minimumWorkers": self._config.minimum_workers,
             "connectionConfig": {
                 "userName": self._config.username,
                 "warehouseName": self._config.warehouse,

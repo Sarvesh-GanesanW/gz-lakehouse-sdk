@@ -83,6 +83,7 @@ class LakehouseConfig:
     site: str | None = None
     compute_size: ComputeSize = "small"
     compute_id: int | None = None
+    minimum_workers: int = 1
     verify_timeout_seconds: int = 30
     query_timeout_seconds: int = 900
     connect_timeout_seconds: int = 10
@@ -143,6 +144,11 @@ class LakehouseConfig:
         if self.parallel_workers == 0:
             raise ConfigurationError(
                 "LakehouseConfig.parallel_workers must be at least 1"
+            )
+
+        if not isinstance(self.minimum_workers, int) or self.minimum_workers < 1:
+            raise ConfigurationError(
+                "LakehouseConfig.minimum_workers must be an int >= 1"
             )
 
         site_value = self.site or self._derive_site_from_url(
