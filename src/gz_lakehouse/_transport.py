@@ -38,9 +38,11 @@ typically lands in 2–3 seconds on a 1 Gb/s link.
 
 from __future__ import annotations
 
+import json
 import time
+from collections import deque
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Literal
 
 
@@ -181,48 +183,74 @@ class Transport:
     ) -> TransportResult:
         """Submit ``sql`` on ``session_id`` and materialise the result.
 
-        The session must already be alive (created via
-        :meth:`start_session`). The provider forwards the statement to
-        the session pod's warm Spark cluster, then returns presigned
-        chunk URLs which we download in parallel. Chunk count is
-        determined server-side from result size — there is no
-        per-call chunking knob.
-
-        ``executor`` overrides the server-side routing decision:
-
-        * ``"auto"`` (default): server picks fast path for simple
-          single-table SELECTs, Spark for everything else.
-        * ``"fast"``: force the PyIceberg fast path. Server returns
-          an error if the query shape is not eligible.
-        * ``"spark"``: skip fast-path detection entirely and route
-          straight to the Spark engine. Useful to compare paths or
-          to dodge a fast-path bug without touching the SDK.
-
-        ``pipeline`` (optional :class:`PipelineConfig`) tunes the
-        fast-path pod-side pipeline (encoder count, upload concurrency,
-        batch sizing, compression level, etc.). Ignored when
-        ``executor`` resolves to Spark.
+        Wraps :meth:`_open_event_stream` and collects every chunk
+        into a single :class:`pyarrow.Table`. The wire is NDJSON when
+        the provider supports it (chunks land as they're produced
+        on the pod) and a legacy JSON envelope otherwise; the
+        consumer code is uniform — both forms surface as a sequence
+        of typed events.
         """
         _validate_executor(executor)
         submit_started = time.monotonic()
-        envelope = self._submit(
-            session_id, sql, executor=executor, pipeline=pipeline,
-        )
-        submit_seconds = time.monotonic() - submit_started
-
-        compressed_bytes = sum(
-            int(c.get("compressedSize") or 0) for c in envelope.chunks
-        )
-        uncompressed_bytes = sum(
-            int(c.get("uncompressedSize") or 0) for c in envelope.chunks
+        event_iter, response = self._open_event_stream(
+            session_id, sql, executor, pipeline,
         )
 
-        if not envelope.chunks:
+        schema: list[dict[str, str]] = []
+        pending: list[Future[pa.Table]] = []
+        pool = ThreadPoolExecutor(
+            max_workers=self._config.parallel_workers,
+            thread_name_prefix="sdk-download",
+        )
+        first_event_at: float | None = None
+        total_rows = 0
+        compressed_bytes = 0
+        uncompressed_bytes = 0
+        download_tables: list[pa.Table] = []
+
+        try:
+            for event in event_iter:
+                if first_event_at is None:
+                    first_event_at = time.monotonic() - submit_started
+                etype = event.get("type")
+                if etype == "schema":
+                    schema = list(event.get("columns") or [])
+                elif etype == "chunk":
+                    pending.append(pool.submit(self._download_chunk, event))
+                    compressed_bytes += int(event.get("compressedSize") or 0)
+                    uncompressed_bytes += int(event.get("uncompressedSize") or 0)
+                elif etype == "heartbeat":
+                    continue
+                elif etype == "done":
+                    total_rows = int(event.get("totalRecords") or 0)
+                    break
+                elif etype == "error":
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise QueryExecutionError(
+                        f"{event.get('errorType') or 'Unknown'}: "
+                        f"{event.get('message') or 'no message'}",
+                    )
+
+            download_started = time.monotonic()
+            download_tables = [f.result() for f in pending]
+            download_seconds = time.monotonic() - download_started
+        finally:
+            pool.shutdown(wait=True)
+            if response is not None:
+                response.close()
+
+        submit_seconds = (
+            first_event_at
+            if first_event_at is not None
+            else (time.monotonic() - submit_started)
+        )
+
+        if not download_tables:
             return TransportResult(
-                table=empty_table_for(envelope.schema),
-                truncated=envelope.truncated,
-                total_rows=envelope.total_rows,
-                schema=envelope.schema,
+                table=empty_table_for(schema),
+                truncated=False,
+                total_rows=total_rows,
+                schema=schema,
                 timings=TransportTimings(
                     submit_seconds=submit_seconds,
                     download_seconds=0.0,
@@ -232,35 +260,17 @@ class Transport:
                 ),
             )
 
-        workers = self._workers_for(envelope.chunks)
-        _logger.info(
-            "Downloading %s chunks with %s workers",
-            len(envelope.chunks),
-            workers,
-        )
-        download_started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            tables = list(pool.map(self._download_chunk, envelope.chunks))
-        table = pa.concat_tables(tables, promote_options="default")
-        download_seconds = time.monotonic() - download_started
-
-        descriptors = (
-            envelope.schema
-            if envelope.schema
-            else schema_to_descriptors(table.schema)
-        )
-        total_rows = (
-            envelope.total_rows if envelope.total_rows else table.num_rows
-        )
+        table = pa.concat_tables(download_tables, promote_options="default")
+        descriptors = schema if schema else schema_to_descriptors(table.schema)
         return TransportResult(
             table=table,
-            truncated=envelope.truncated,
-            total_rows=total_rows,
+            truncated=False,
+            total_rows=total_rows or table.num_rows,
             schema=descriptors,
             timings=TransportTimings(
                 submit_seconds=submit_seconds,
                 download_seconds=download_seconds,
-                chunk_count=len(envelope.chunks),
+                chunk_count=len(download_tables),
                 compressed_bytes=compressed_bytes,
                 uncompressed_bytes=uncompressed_bytes,
             ),
@@ -276,29 +286,150 @@ class Transport:
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result chunk-by-chunk as :class:`pyarrow.RecordBatch`.
 
-        Chunk downloads run on a thread pool with up to
-        ``parallel_workers`` in flight; results are yielded in
-        submission order so the caller always sees a stable row order.
-        Memory stays bounded to roughly ``parallel_workers`` chunks at
-        any moment. ``executor`` and ``pipeline`` have the same
-        meaning as on :meth:`execute`.
+        With a streaming-aware provider, the first batch lands in
+        the caller's hands roughly one network round-trip after the
+        pod produces its first chunk — no need to wait for the whole
+        scan to finish before consuming. Memory stays bounded to
+        roughly ``parallel_workers`` chunks in flight at once.
+        Yields are in submission order so row order across chunks
+        stays stable for downstream code.
         """
         _validate_executor(executor)
-        envelope = self._submit(
-            session_id, sql, executor=executor, pipeline=pipeline,
+        event_iter, response = self._open_event_stream(
+            session_id, sql, executor, pipeline,
         )
-        if not envelope.chunks:
-            return
+        pending: deque[Future[pa.Table]] = deque()
+        pool = ThreadPoolExecutor(
+            max_workers=self._config.parallel_workers,
+            thread_name_prefix="sdk-download-iter",
+        )
+        try:
+            for event in event_iter:
+                etype = event.get("type")
+                if etype == "chunk":
+                    pending.append(pool.submit(self._download_chunk, event))
+                    while pending and pending[0].done():
+                        table = pending.popleft().result()
+                        yield from table.to_batches(max_chunksize=batch_size)
+                elif etype == "heartbeat":
+                    continue
+                elif etype == "schema":
+                    continue
+                elif etype == "done":
+                    break
+                elif etype == "error":
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise QueryExecutionError(
+                        f"{event.get('errorType') or 'Unknown'}: "
+                        f"{event.get('message') or 'no message'}",
+                    )
 
-        workers = self._workers_for(envelope.chunks)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(self._download_chunk, chunk)
-                for chunk in envelope.chunks
-            ]
-            for future in futures:
-                table = future.result()
+            while pending:
+                table = pending.popleft().result()
                 yield from table.to_batches(max_chunksize=batch_size)
+        finally:
+            pool.shutdown(wait=True)
+            if response is not None:
+                response.close()
+
+    def _open_event_stream(
+        self,
+        session_id: str,
+        sql: str,
+        executor: ExecutorChoice,
+        pipeline: PipelineConfig | None,
+    ) -> tuple[Iterator[dict[str, Any]], Any]:
+        """Open a request and adapt the response to a stream of events.
+
+        Sends ``Accept: application/x-ndjson`` so a streaming-capable
+        provider returns its NDJSON form; older providers ignore the
+        header and return the classic JSON envelope. Returns a tuple
+        ``(events, response)``: ``events`` is a generator the caller
+        iterates, ``response`` is the underlying HTTP response (or
+        ``None`` for the legacy path) which the caller is responsible
+        for closing in a ``finally`` block. Legacy responses are read
+        eagerly inside this method, so the response object is closed
+        before return and the generator just walks an in-memory
+        envelope.
+        """
+        payload = self._build_statement_payload(session_id, sql, executor, pipeline)
+        response = self._http.post(
+            path=_STATEMENTS_PATH,
+            json_body=payload,
+            timeout_seconds=self._config.query_timeout_seconds,
+            accept="application/x-ndjson",
+            stream=True,
+        )
+
+        if response.content_type == "application/x-ndjson":
+            return self._iter_ndjson(response), response
+
+        try:
+            envelope_body = response.json()
+        finally:
+            response.close()
+        envelope = self._parse_envelope(envelope_body)
+        return self._synthesize_events(envelope), None
+
+    def _build_statement_payload(
+        self,
+        session_id: str,
+        sql: str,
+        executor: ExecutorChoice,
+        pipeline: PipelineConfig | None,
+    ) -> dict[str, Any]:
+        """Compose the request body for ``POST /v1/statements``."""
+        payload: dict[str, Any] = {
+            "sessionId": session_id,
+            "connectionConfig": {
+                "config": {
+                    "userName": self._config.username,
+                    "password": self._config.password,
+                    "warehouseName": self._config.warehouse,
+                },
+            },
+            "query": sql,
+        }
+        if executor != "auto":
+            payload["executor"] = executor
+        if pipeline is not None:
+            wire = pipeline.to_wire()
+            if wire:
+                payload["pipelineConfig"] = wire
+        return payload
+
+    @staticmethod
+    def _iter_ndjson(response: Any) -> Iterator[dict[str, Any]]:
+        """Yield parsed JSON objects, one per line of the streaming body."""
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                _logger.warning("dropping malformed NDJSON line: %.120r", line)
+                continue
+            if isinstance(event, dict):
+                yield event
+
+    @staticmethod
+    def _synthesize_events(envelope: _Envelope) -> Iterator[dict[str, Any]]:
+        """Render a legacy JSON envelope as a sequence of streaming events.
+
+        Lets the consumer code in :meth:`execute` and
+        :meth:`iter_batches` treat both wire formats identically:
+        one schema, then one chunk per descriptor, then a done.
+        """
+        yield {"type": "schema", "columns": envelope.schema}
+        for chunk in envelope.chunks:
+            event = {"type": "chunk"}
+            event.update(chunk)
+            yield event
+        yield {
+            "type": "done",
+            "totalRecords": envelope.total_rows,
+            "hasMore": envelope.truncated,
+        }
 
     def start_session(self) -> str:
         """Create a warm compute session and return its sessionId.
@@ -404,42 +535,6 @@ class Transport:
         """Release the dedicated S3 session pool."""
         self._s3_session.close()
 
-    def _submit(
-        self,
-        session_id: str,
-        sql: str,
-        executor: ExecutorChoice = "auto",
-        pipeline: PipelineConfig | None = None,
-    ) -> _Envelope:
-        """POST the SQL on ``session_id`` and parse the chunk envelope."""
-        payload: dict[str, Any] = {
-            "sessionId": session_id,
-            "connectionConfig": {
-                "config": {
-                    "userName": self._config.username,
-                    "password": self._config.password,
-                    "warehouseName": self._config.warehouse,
-                },
-            },
-            "query": sql,
-        }
-        if executor != "auto":
-            payload["executor"] = executor
-        if pipeline is not None:
-            wire = pipeline.to_wire()
-            if wire:
-                payload["pipelineConfig"] = wire
-        response = self._http.post(
-            path=_STATEMENTS_PATH,
-            json_body=payload,
-            timeout_seconds=self._config.query_timeout_seconds,
-        )
-        try:
-            envelope = response.json()
-        finally:
-            response.close()
-        return self._parse_envelope(envelope)
-
     @staticmethod
     def _parse_envelope(envelope: Any) -> _Envelope:
         """Validate the envelope shape and extract the chunk metadata.
@@ -509,10 +604,6 @@ class Transport:
             total_rows=_safe_int(envelope.get("totalRecords"), default=0),
             truncated=bool(envelope.get("hasMore")),
         )
-
-    def _workers_for(self, chunks: list[dict[str, Any]]) -> int:
-        """Cap the worker count at ``min(parallel_workers, chunk_count)``."""
-        return max(1, min(self._config.parallel_workers, len(chunks)))
 
     def _download_chunk(self, chunk: dict[str, Any]) -> pa.Table:
         """Fetch a single presigned-URL chunk and parse its Arrow IPC stream.

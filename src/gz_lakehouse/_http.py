@@ -86,6 +86,15 @@ class HttpResponse:
         """Stream the body in ``chunk_size`` byte chunks."""
         return self._response.iter_content(chunk_size=chunk_size)
 
+    def iter_lines(self, decode_unicode: bool = True) -> Any:
+        """Stream the body as a sequence of lines.
+
+        Used by the NDJSON transport: each line is one JSON event.
+        Decodes UTF-8 by default (events arrive as ``str``); set
+        ``decode_unicode=False`` to receive raw ``bytes``.
+        """
+        return self._response.iter_lines(decode_unicode=decode_unicode)
+
     def json(self) -> Mapping[str, Any]:
         """Decode the body as JSON using ``orjson`` when available."""
         body = self._response.content
