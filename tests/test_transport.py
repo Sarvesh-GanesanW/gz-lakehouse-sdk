@@ -12,7 +12,7 @@ import responses
 
 from gz_lakehouse import LakehouseConfig
 from gz_lakehouse._http import HttpClient
-from gz_lakehouse._transport import Transport
+from gz_lakehouse._transport import Transport, _IterBytesReader
 from gz_lakehouse.exceptions import QueryExecutionError
 
 PROVIDER_URL = "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
@@ -627,3 +627,38 @@ def test_http2_client_uses_transport_with_retries() -> None:
     finally:
         transport.close()
         http.close()
+
+
+def test_iter_bytes_reader_assembles_small_reads_across_chunks() -> None:
+    """Small reads pull exact N bytes even when frames straddle them."""
+    reader = _IterBytesReader(iter([b"hello", b" ", b"world"]))
+
+    buf = bytearray(5)
+    assert reader.readinto(buf) == 5
+    assert bytes(buf) == b"hello"
+
+    buf = bytearray(6)
+    assert reader.readinto(buf) == 6
+    assert bytes(buf) == b" world"
+
+
+def test_iter_bytes_reader_returns_zero_on_eof() -> None:
+    """Once the iterator is drained, readinto returns 0."""
+    reader = _IterBytesReader(iter([b"abc"]))
+
+    buf = bytearray(10)
+    assert reader.readinto(buf) == 3
+    assert bytes(buf[:3]) == b"abc"
+    assert reader.readinto(buf) == 0
+
+
+def test_iter_bytes_reader_parses_arrow_ipc_stream() -> None:
+    """A frame-fragmented IPC stream still parses to the same Arrow table."""
+    table = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+    body = _arrow_ipc_bytes(table)
+    fragments = [body[i : i + 7] for i in range(0, len(body), 7)]
+
+    reader = _IterBytesReader(iter(fragments))
+    parsed = paipc.RecordBatchStreamReader(reader).read_all()
+
+    assert parsed.column("id").to_pylist() == [1, 2, 3]

@@ -5,8 +5,8 @@ authenticate against it. Validates the URL and derives the ``site``
 component used by the provider's middleware to route requests.
 
 Performance knobs (``parallel_workers``, ``pool_maxsize``,
-``prefer_arrow``) tune the new high-throughput data plane introduced in
-``0.2.0``. They can be left at their defaults for plug-and-play use.
+``enable_http2``) tune the high-throughput data plane. They can be
+left at their defaults for plug-and-play use.
 """
 
 from __future__ import annotations
@@ -57,11 +57,6 @@ class LakehouseConfig:
         query_timeout_seconds: Timeout for synchronous query execution.
         connect_timeout_seconds: TCP/TLS handshake timeout enforced
             independently from ``query_timeout_seconds``.
-        prefer_arrow: When ``True`` (default) the client advertises
-            Arrow IPC and chunked-Parquet content types via ``Accept`` and
-            uses whichever the provider responds with. Falls back to the
-            JSON envelope path automatically when the provider has not
-            yet enabled the high-throughput data plane.
         parallel_workers: Worker count for the chunked-Parquet transport
             (parallel S3 fetches) and for :meth:`query_parallel`.
         pool_connections: Number of connection pools the underlying
@@ -96,7 +91,6 @@ class LakehouseConfig:
     verify_timeout_seconds: int = 30
     query_timeout_seconds: int = 900
     connect_timeout_seconds: int = 10
-    prefer_arrow: bool = True
     parallel_workers: int = 32
     pool_connections: int = 4
     pool_maxsize: int = 64
@@ -182,7 +176,6 @@ class LakehouseConfig:
             f"warehouse={safe.warehouse!r}, database={safe.database!r}, "
             f"username={safe.username!r}, password={_PASSWORD_REDACTED!r}, "
             f"site={safe.site!r}, compute_id={safe.compute_id}, "
-            f"prefer_arrow={safe.prefer_arrow}, "
             f"parallel_workers={safe.parallel_workers})"
         )
 

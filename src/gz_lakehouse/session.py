@@ -29,6 +29,8 @@ import re
 import threading
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from decimal import Decimal
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -483,15 +485,51 @@ def _compose_partitioned_sql(
 
 
 def _render_literal(value: Any) -> str:
-    """Render a Python value as a SQL literal for partition bounds."""
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, (int, float)):
-        return str(value)
+    """Render a Python value as a SQL literal for partition bounds.
+
+    The wire protocol does not support parameterized queries for
+    partition bounds — the SDK has to inline the value into the
+    BETWEEN predicate. This is safe for *trusted* call-site bounds
+    (programmatic ranges, IDs from a manifest, computed timestamps),
+    which is the only intended use of fan-out APIs. Do not pass
+    bounds derived from untrusted user input here; the SDK escapes
+    single quotes in strings the ANSI-correct way (``'`` → ``''``)
+    so a single-quoted string cannot break out of its literal, but
+    it cannot defend against type-confusion or the user passing a
+    raw SQL fragment as a "bound."
+
+    Native types render with their typed SQL syntax so the provider
+    does not have to guess at coercion:
+
+    * ``int`` / ``float`` / ``Decimal`` → unquoted numeric literal
+    * ``bool`` → ``TRUE`` / ``FALSE``
+    * ``None`` → ``NULL``
+    * ``datetime.date`` → ``DATE 'YYYY-MM-DD'``
+    * ``datetime.datetime`` → ``TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'``
+    * ``str`` → escaped, single-quoted ANSI string
+
+    Bytes / arbitrary objects are rejected outright: there is no
+    well-defined SQL representation, and silently calling ``str()`` on
+    them would mask a caller-side bug.
+    """
     if value is None:
         return "NULL"
-    escaped = str(value).replace("'", "''")
-    return f"'{escaped}'"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float, Decimal)):
+        return str(value)
+    if isinstance(value, datetime):
+        return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+    if isinstance(value, date):
+        return f"DATE '{value.isoformat()}'"
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    raise QueryValidationError(
+        f"Cannot render partition bound of type {type(value).__name__!r} "
+        f"as a SQL literal; pass int, float, Decimal, bool, str, "
+        f"datetime.date, or datetime.datetime",
+    )
 
 
 def _merge_timings(
