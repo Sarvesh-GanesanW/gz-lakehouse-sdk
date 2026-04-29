@@ -161,9 +161,12 @@ _logger = get_logger("transport")
 class TransportTimings:
     """Per-execution wall-clock breakdown captured by :class:`Transport`.
 
-    Useful for benchmarks and ops dashboards: the three numbers add up
-    to the total query latency and split cleanly into the two phases
-    that dominate it (server-side compute + client-side download).
+    Useful for benchmarks and ops dashboards: the timings add up to
+    total query latency split between server-side compute and
+    client-side download. ``executor`` reports which engine the pod
+    actually ran the statement on (``"pyiceberg"`` for the fast path,
+    ``"spark"`` for full Spark SQL); useful for A/B comparisons and
+    for understanding why an "auto" query took the path it did.
     """
 
     def __init__(
@@ -173,6 +176,7 @@ class TransportTimings:
         chunk_count: int,
         compressed_bytes: int,
         uncompressed_bytes: int,
+        executor: str | None = None,
     ) -> None:
         """Hold the timing and size breakdown for a single execution."""
         self.submit_seconds = submit_seconds
@@ -180,6 +184,7 @@ class TransportTimings:
         self.chunk_count = chunk_count
         self.compressed_bytes = compressed_bytes
         self.uncompressed_bytes = uncompressed_bytes
+        self.executor = executor
 
     @property
     def total_seconds(self) -> float:
@@ -311,6 +316,7 @@ class Transport:
         uncompressed_bytes = 0
         download_tables: list[pa.Table] = []
         download_seconds = 0.0
+        used_executor: str | None = None
 
         try:
             for event in event_iter:
@@ -330,6 +336,7 @@ class Transport:
                     uncompressed_bytes += chunk_uncompressed
                 elif etype == "done":
                     total_rows = int(event.get("totalRecords") or 0)
+                    used_executor = event.get("executor")
                     break
                 elif etype == "error":
                     _cancel_pending(pending)
@@ -364,6 +371,7 @@ class Transport:
                     chunk_count=0,
                     compressed_bytes=0,
                     uncompressed_bytes=0,
+                    executor=used_executor,
                 ),
             )
 
@@ -380,6 +388,7 @@ class Transport:
                 chunk_count=len(download_tables),
                 compressed_bytes=compressed_bytes,
                 uncompressed_bytes=uncompressed_bytes,
+                executor=used_executor,
             ),
         )
 

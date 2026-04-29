@@ -18,8 +18,10 @@ from gz_lakehouse import (
     QueryExecutionError,
     QueryValidationError,
 )
+from gz_lakehouse._transport import TransportTimings
 from gz_lakehouse.session import (
     _compose_partitioned_sql,
+    _merge_timings,
     _render_literal,
     _validate_partition_template,
 )
@@ -215,6 +217,30 @@ def test_iter_batches_split_with_explicit_bounds() -> None:
             rows.extend(batch.column("id").to_pylist())
 
     assert sorted(rows) == [1, 2, 3, 4, 5, 6]
+
+
+def test_merge_timings_unifies_executor_when_legs_agree() -> None:
+    """All legs on the same engine surface that value as the merged one."""
+    legs = [
+        TransportTimings(0.1, 0.2, 1, 100, 200, executor="pyiceberg"),
+        TransportTimings(0.3, 0.5, 2, 300, 600, executor="pyiceberg"),
+    ]
+    merged = _merge_timings(legs)
+
+    assert merged is not None
+    assert merged.executor == "pyiceberg"
+
+
+def test_merge_timings_marks_mixed_when_legs_disagree() -> None:
+    """Legs that fell to different engines surface as ``mixed``."""
+    legs = [
+        TransportTimings(0.1, 0.2, 1, 100, 200, executor="pyiceberg"),
+        TransportTimings(0.3, 0.5, 2, 300, 600, executor="spark"),
+    ]
+    merged = _merge_timings(legs)
+
+    assert merged is not None
+    assert merged.executor == "mixed"
 
 
 @responses.activate

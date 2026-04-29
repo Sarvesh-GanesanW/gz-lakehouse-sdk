@@ -2,7 +2,7 @@
 
 Plug-and-play Python SDK for the GroundZero Lakehouse — query Iceberg tables over HTTPS from any Python environment, no Spark or JDBC required.
 
-`0.3.0` introduces an explicit **session API** — start a warm compute pod once, run many statements against it, stop when done. The data plane stays Snowflake-style: the provider hands back presigned S3 URLs to Arrow IPC chunks, and the client downloads them in parallel.
+The data plane is Snowflake-style: the provider hands back presigned S3 URLs to Arrow IPC chunks, and the client downloads them in parallel. An explicit **session API** lets you boot a warm compute pod once and run many statements against it; an NDJSON event stream surfaces schema and chunks as they land on the pod, and the first chunk can ride inline so the very first batch reaches the caller without an extra S3 round-trip. Optional HTTP/2 chunk transport (`enable_http2=True`) multiplexes parallel chunk fetches over a single TCP connection.
 
 ## Install
 
@@ -234,6 +234,8 @@ The data plane requires the provider to:
 - Async-native client (`AsyncLakehouseClient`) sharing the same transport layer.
 - `client.write_table(df, ...)` write path uploading Arrow IPC chunks to S3.
 - OpenTelemetry tracing as an optional extra.
+- Server-side cancellation hook so a fast-failing `query_parallel` leg actually frees pod compute.
+- Shared compute-id schema (currently hardcoded both sides as small=1003, medium=1006, large=1009, xlarge=1012, 2xlarge=1015).
 
 The public API is stable across these upgrades — only the wire format and helpers evolve underneath.
 
