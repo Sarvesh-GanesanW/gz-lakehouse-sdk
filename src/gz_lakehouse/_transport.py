@@ -43,6 +43,7 @@ import hashlib
 import io
 import json
 import random
+import threading
 import time
 from collections import deque
 from collections.abc import Iterator
@@ -201,6 +202,38 @@ class Transport:
         self._s3_http2_client: httpx.Client | None = (
             self._build_s3_http2_client() if config.enable_http2 else None
         )
+        self._download_pool: ThreadPoolExecutor | None = None
+        self._pool_lock = threading.Lock()
+
+    def _submit_chunk(
+        self,
+        pool: ThreadPoolExecutor,
+        event: dict[str, Any],
+    ) -> Future[pa.Table]:
+        """Submit a chunk decode (inline or S3-presigned) to the pool."""
+        if "inline" in event:
+            return pool.submit(self._decode_inline_chunk, event)
+        return pool.submit(self._download_chunk, event)
+
+    def _get_download_pool(self) -> ThreadPoolExecutor:
+        """Return the transport-shared chunk-download thread pool.
+
+        One pool is created lazily and reused across every ``execute``
+        and ``iter_batches`` call on this transport. Sharing matters for
+        fan-out APIs (``query_parallel``, ``iter_batches_split``): each
+        leg used to spawn its own ``parallel_workers``-sized pool, so a
+        16-leg fan-out on top of ``parallel_workers=32`` would create
+        512 download threads competing for the same network. With one
+        shared pool the cap is just ``parallel_workers`` regardless of
+        leg count.
+        """
+        with self._pool_lock:
+            if self._download_pool is None:
+                self._download_pool = ThreadPoolExecutor(
+                    max_workers=self._config.parallel_workers,
+                    thread_name_prefix="sdk-download",
+                )
+            return self._download_pool
 
     def execute(
         self,
@@ -229,55 +262,46 @@ class Transport:
 
         schema: list[dict[str, str]] = []
         pending: list[Future[pa.Table]] = []
-        pool = ThreadPoolExecutor(
-            max_workers=self._config.parallel_workers,
-            thread_name_prefix="sdk-download",
-        )
+        pool = self._get_download_pool()
         first_event_at: float | None = None
         total_rows = 0
         compressed_bytes = 0
         uncompressed_bytes = 0
         download_tables: list[pa.Table] = []
+        download_seconds = 0.0
 
         try:
             for event in event_iter:
+                etype = event.get("type")
+                if etype == "heartbeat":
+                    continue
                 if first_event_at is None:
                     first_event_at = time.monotonic() - submit_started
-                etype = event.get("type")
                 if etype == "schema":
                     schema = list(event.get("columns") or [])
                 elif etype == "chunk":
-                    if "inline" in event:
-                        pending.append(
-                            pool.submit(self._decode_inline_chunk, event),
-                        )
-                    else:
-                        pending.append(
-                            pool.submit(self._download_chunk, event),
-                        )
+                    pending.append(self._submit_chunk(pool, event))
                     compressed_bytes += int(
                         event.get("compressedSize") or 0,
                     )
                     uncompressed_bytes += int(
                         event.get("uncompressedSize") or 0,
                     )
-                elif etype == "heartbeat":
-                    continue
                 elif etype == "done":
                     total_rows = int(event.get("totalRecords") or 0)
                     break
                 elif etype == "error":
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise QueryExecutionError(
-                        f"{event.get('errorType') or 'Unknown'}: "
-                        f"{event.get('message') or 'no message'}",
-                    )
+                    _cancel_pending(pending)
+                    raise QueryExecutionError(_format_error_event(event))
 
             download_started = time.monotonic()
-            download_tables = [f.result() for f in pending]
+            try:
+                download_tables = [f.result() for f in pending]
+            except BaseException:
+                _cancel_pending(pending)
+                raise
             download_seconds = time.monotonic() - download_started
         finally:
-            pool.shutdown(wait=True)
             if response is not None:
                 response.close()
 
@@ -344,22 +368,12 @@ class Transport:
             pipeline,
         )
         pending: deque[Future[pa.Table]] = deque()
-        pool = ThreadPoolExecutor(
-            max_workers=self._config.parallel_workers,
-            thread_name_prefix="sdk-download-iter",
-        )
+        pool = self._get_download_pool()
         try:
             for event in event_iter:
                 etype = event.get("type")
                 if etype == "chunk":
-                    if "inline" in event:
-                        pending.append(
-                            pool.submit(self._decode_inline_chunk, event),
-                        )
-                    else:
-                        pending.append(
-                            pool.submit(self._download_chunk, event),
-                        )
+                    pending.append(self._submit_chunk(pool, event))
                     while pending and pending[0].done():
                         table = pending.popleft().result()
                         yield from table.to_batches(max_chunksize=batch_size)
@@ -368,17 +382,14 @@ class Transport:
                 elif etype == "done":
                     break
                 elif etype == "error":
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise QueryExecutionError(
-                        f"{event.get('errorType') or 'Unknown'}: "
-                        f"{event.get('message') or 'no message'}",
-                    )
+                    _cancel_pending(pending)
+                    raise QueryExecutionError(_format_error_event(event))
 
             while pending:
                 table = pending.popleft().result()
                 yield from table.to_batches(max_chunksize=batch_size)
         finally:
-            pool.shutdown(wait=True)
+            _cancel_pending(pending)
             if response is not None:
                 response.close()
 
@@ -622,11 +633,18 @@ class Transport:
         response.close()
 
     def close(self) -> None:
-        """Release the dedicated S3 session pool."""
+        """Release the dedicated S3 session pool and download workers."""
         self._s3_session.close()
         if self._s3_http2_client is not None:
             self._s3_http2_client.close()
             self._s3_http2_client = None
+        with self._pool_lock:
+            if self._download_pool is not None:
+                self._download_pool.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
+                self._download_pool = None
 
     @staticmethod
     def _parse_envelope(envelope: Any) -> _Envelope:
@@ -945,11 +963,13 @@ class Transport:
     def _build_s3_http2_client(self) -> httpx.Client:
         """Build the httpx HTTP/2 client used for chunk downloads.
 
-        ``http2=True`` enables the h2 negotiation; servers that don't
-        support h2 transparently fall back to HTTP/1.1 so the client
-        is safe to enable broadly. ``Limits`` mirror the requests
-        pool sizing so concurrent chunks see uniform behavior across
-        the two backends.
+        Uses an explicit :class:`httpx.HTTPTransport` so the h2 client
+        gets the same connect-retry safety net as the requests-backed
+        path: a bare TCP RST mid-handshake retries at the transport
+        layer rather than failing fast and depending on the
+        application-level retry to compensate. Application-level retry
+        for status codes (408/429/5xx) and partial-body parse failures
+        still lives in :meth:`_download_chunk`.
         """
         timeout = httpx.Timeout(
             connect=float(self._config.connect_timeout_seconds),
@@ -964,12 +984,30 @@ class Transport:
             ),
             max_keepalive_connections=self._config.pool_maxsize,
         )
-        return httpx.Client(
+        transport = httpx.HTTPTransport(
             http2=True,
+            retries=self._config.max_retries,
+        )
+        return httpx.Client(
             timeout=timeout,
             limits=limits,
+            transport=transport,
             follow_redirects=False,
         )
+
+
+def _cancel_pending(pending: Iterator[Future[pa.Table]]) -> None:
+    """Cancel any not-yet-running futures left behind by a failed call."""
+    for f in pending:
+        f.cancel()
+
+
+def _format_error_event(event: dict[str, Any]) -> str:
+    """Render an NDJSON ``error`` event as a single-line string."""
+    return (
+        f"{event.get('errorType') or 'Unknown'}: "
+        f"{event.get('message') or 'no message'}"
+    )
 
 
 def _validate_executor(executor: str) -> None:
