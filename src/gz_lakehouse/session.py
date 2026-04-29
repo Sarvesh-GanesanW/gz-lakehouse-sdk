@@ -24,6 +24,7 @@ time.
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import re
 import threading
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
 
 _SPLIT_QUEUE_DEPTH_PER_THREAD = 4
 _SPLIT_THREAD_JOIN_TIMEOUT = 5.0
+_SPLIT_QUEUE_PUT_TIMEOUT_SECONDS = 0.5
 
 _SQL_LITERAL_PATTERN = re.compile(r"'(?:''|[^'])*'")
 
@@ -600,8 +602,25 @@ def _interleave_iter_batches(
 
     Each SQL gets its own worker thread that pushes batches into a
     bounded shared queue; the main generator yields from the queue
-    in arrival order. A shutdown event is set on the first error so
-    in-flight workers can exit before the queue stays half-drained.
+    in arrival order. A shutdown event is set on the first error or
+    on consumer exit so in-flight workers can exit promptly instead
+    of running to completion.
+
+    Cancellation is co-operative across two failure modes:
+
+    * Worker discovers the consumer has stopped (consumer breaks out
+      of the ``for batch in iter_batches_split(...)`` loop, the main
+      generator's ``finally`` sets ``shutdown``). Workers test
+      ``shutdown`` between batches AND use a bounded ``queue.put``
+      with a small timeout so a full queue with no consumer doesn't
+      pin the worker forever.
+    * Worker raises (a leg's transport.iter_batches fails). The
+      first exception is captured, ``shutdown`` is set, the main
+      generator drains its sentinel count and re-raises.
+
+    The main generator's ``finally`` also drains anything left in
+    the queue so a worker blocked on ``put`` can make progress to
+    its sentinel and exit.
     """
     out_queue: queue.Queue[Any] = queue.Queue(
         maxsize=max(len(sqls) * _SPLIT_QUEUE_DEPTH_PER_THREAD, len(sqls)),
@@ -619,15 +638,27 @@ def _interleave_iter_batches(
                 executor=executor,
                 pipeline=pipeline,
             ):
-                if shutdown.is_set():
+                while not shutdown.is_set():
+                    try:
+                        out_queue.put(
+                            batch,
+                            timeout=_SPLIT_QUEUE_PUT_TIMEOUT_SECONDS,
+                        )
+                        break
+                    except queue.Full:
+                        continue
+                else:
                     return
-                out_queue.put(batch)
         except BaseException as ex:
             if not error_box:
                 error_box.append(ex)
             shutdown.set()
         finally:
-            out_queue.put(sentinel)
+            with contextlib.suppress(queue.Full):
+                out_queue.put(
+                    sentinel,
+                    timeout=_SPLIT_QUEUE_PUT_TIMEOUT_SECONDS,
+                )
 
     threads = [
         threading.Thread(
@@ -653,6 +684,11 @@ def _interleave_iter_batches(
             raise error_box[0]
     finally:
         shutdown.set()
+        while True:
+            try:
+                out_queue.get_nowait()
+            except queue.Empty:
+                break
         for thread in threads:
             thread.join(timeout=_SPLIT_THREAD_JOIN_TIMEOUT)
 

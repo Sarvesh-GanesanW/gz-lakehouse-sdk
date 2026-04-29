@@ -217,6 +217,51 @@ def test_iter_batches_split_with_explicit_bounds() -> None:
     assert sorted(rows) == [1, 2, 3, 4, 5, 6]
 
 
+@responses.activate
+def test_iter_batches_split_consumer_break_does_not_hang() -> None:
+    """Breaking out of the iterator early releases workers via shutdown drain.
+
+    Without the drain in the main generator's finally, a worker
+    blocked on a full ``out_queue.put`` would not see ``shutdown``
+    and session teardown would hang. With the drain it exits.
+    """
+    _stub_session_lifecycle()
+    big = pa.table({"id": pa.array(list(range(1000)), type=pa.int64())})
+    for i in range(2):
+        responses.add(
+            responses.POST,
+            f"{PROVIDER_URL}/iceberg/v1/statements",
+            json={
+                "schema": [{"columnName": "id", "dataType": "BIGINT"}],
+                "totalRecords": 1000,
+                "hasMore": False,
+                "chunks": [{"url": S3_URL_TEMPLATE.format(i)}],
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            S3_URL_TEMPLATE.format(i),
+            body=_arrow_ipc_bytes(big),
+            status=200,
+        )
+
+    rows_seen: list[int] = []
+    with LakehouseClient(_config()) as client, client.start_session() as s:
+        for batch in s.iter_batches_split(
+            "SELECT id FROM customers",
+            split_by="id",
+            splits=2,
+            bounds=(0, 999),
+            batch_size=10,
+        ):
+            rows_seen.extend(batch.column("id").to_pylist())
+            if len(rows_seen) >= 5:
+                break
+
+    assert len(rows_seen) >= 5
+
+
 def test_render_literal_renders_native_types() -> None:
     """Numbers, bool, None, and strings render with the right SQL syntax."""
     assert _render_literal(42) == "42"
