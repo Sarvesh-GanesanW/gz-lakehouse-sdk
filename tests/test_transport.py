@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json as _json
 
@@ -12,8 +13,12 @@ import responses
 
 from gz_lakehouse import LakehouseConfig
 from gz_lakehouse._http import HttpClient
-from gz_lakehouse._transport import Transport, _IterBytesReader
-from gz_lakehouse.exceptions import QueryExecutionError
+from gz_lakehouse._transport import (
+    Transport,
+    _chunk_byte_estimate,
+    _IterBytesReader,
+)
+from gz_lakehouse.exceptions import QueryExecutionError, TransportError
 
 PROVIDER_URL = "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
 S3_URL_TEMPLATE = "https://s3.example.com/chunk-{}.arrow"
@@ -662,3 +667,55 @@ def test_iter_bytes_reader_parses_arrow_ipc_stream() -> None:
     parsed = paipc.RecordBatchStreamReader(reader).read_all()
 
     assert parsed.column("id").to_pylist() == [1, 2, 3]
+
+
+def test_chunk_byte_estimate_uses_declared_sizes() -> None:
+    """When the server declares both sizes, helper trusts them as-is."""
+    event = {"compressedSize": 1234, "uncompressedSize": 5678}
+    assert _chunk_byte_estimate(event) == (1234, 5678)
+
+
+def test_chunk_byte_estimate_estimates_inline_compressed_size() -> None:
+    """Inline events without compressedSize fall back to b64-decoded length."""
+    raw = b"x" * 30
+    inline_b64 = base64.b64encode(raw).decode("ascii")
+    event = {"inline": inline_b64}
+
+    compressed, uncompressed = _chunk_byte_estimate(event)
+
+    assert compressed == 30
+    assert uncompressed == 0
+
+
+def test_chunk_byte_estimate_inline_declared_compressed_wins() -> None:
+    """Declared compressedSize wins over the b64-length estimate."""
+    inline_b64 = base64.b64encode(b"x" * 30).decode("ascii")
+    event = {"inline": inline_b64, "compressedSize": 99}
+    assert _chunk_byte_estimate(event) == (99, 0)
+
+
+@responses.activate
+def test_ndjson_malformed_line_raises_transport_error() -> None:
+    """Corrupt NDJSON lines surface as ``TransportError``, not silent drop."""
+    body = (
+        b'{"type":"schema","columns":[]}\n'
+        b'{"type":"chunk","this is no\n'
+        b'{"type":"done","totalRecords":0}\n'
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        body=body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        with pytest.raises(TransportError, match="malformed NDJSON"):
+            transport.execute(SESSION_ID, "SELECT 1")
+    finally:
+        transport.close()
+        http.close()

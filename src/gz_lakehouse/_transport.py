@@ -323,12 +323,11 @@ class Transport:
                     schema = list(event.get("columns") or [])
                 elif etype == "chunk":
                     pending.append(self._submit_chunk(pool, event))
-                    compressed_bytes += int(
-                        event.get("compressedSize") or 0,
+                    chunk_compressed, chunk_uncompressed = (
+                        _chunk_byte_estimate(event)
                     )
-                    uncompressed_bytes += int(
-                        event.get("uncompressedSize") or 0,
-                    )
+                    compressed_bytes += chunk_compressed
+                    uncompressed_bytes += chunk_uncompressed
                 elif etype == "done":
                     total_rows = int(event.get("totalRecords") or 0)
                     break
@@ -543,15 +542,25 @@ class Transport:
 
     @staticmethod
     def _iter_ndjson(response: Any) -> Iterator[dict[str, Any]]:
-        """Yield parsed JSON objects, one per line of the streaming body."""
+        """Yield parsed JSON objects, one per line of the streaming body.
+
+        A malformed NDJSON line means the wire is corrupted (truncated
+        frame, partial body, broken upstream). Silently dropping it
+        risks losing schema/chunk/done events and leaving the consumer
+        wedged or with a partial result. Surface as
+        :class:`TransportError` so the caller sees the failure
+        immediately rather than getting a mysteriously-truncated table.
+        """
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
-                _logger.warning("dropping malformed NDJSON line: %.120r", line)
-                continue
+            except json.JSONDecodeError as ex:
+                raise TransportError(
+                    f"Provider sent malformed NDJSON line "
+                    f"(first 120 chars: {line[:120]!r}): {ex}",
+                ) from ex
             if isinstance(event, dict):
                 yield event
 
@@ -1043,6 +1052,27 @@ def _cancel_pending(pending: Iterator[Future[pa.Table]]) -> None:
     """Cancel any not-yet-running futures left behind by a failed call."""
     for f in pending:
         f.cancel()
+
+
+def _chunk_byte_estimate(event: dict[str, Any]) -> tuple[int, int]:
+    """Return ``(compressed, uncompressed)`` byte counts for an event.
+
+    For S3-presigned chunks the pod fills both ``compressedSize`` and
+    ``uncompressedSize`` directly. For inline chunks the pod has been
+    seen to omit one or both — the IPC bytes ride embedded in the
+    NDJSON event itself, so the wire size is implicit. To keep
+    :class:`TransportTimings` accurate (compressed throughput
+    dashboards underreported by the inline payload) the SDK estimates
+    the compressed size from the base64 payload length when the
+    server omits it: a base64 string of length L decodes to roughly
+    ``(L * 3) // 4`` bytes minus padding characters.
+    """
+    declared_compressed = int(event.get("compressedSize") or 0)
+    declared_uncompressed = int(event.get("uncompressedSize") or 0)
+    if "inline" in event and not declared_compressed:
+        b64 = event.get("inline") or ""
+        declared_compressed = (len(b64) * 3) // 4 - b64.count("=")
+    return (declared_compressed, declared_uncompressed)
 
 
 def _format_error_event(event: dict[str, Any]) -> str:
