@@ -191,6 +191,61 @@ class HttpClient:
         session.mount("https://", adapter)
         return session
 
+    def get(
+        self,
+        path: str,
+        timeout_seconds: int,
+        accept: str = "application/json",
+        stream: bool = False,
+    ) -> HttpResponse:
+        """GET ``path`` and return an :class:`HttpResponse`.
+
+        Used by the deferred-statement polling path: the SDK GETs
+        ``/iceberg/v1/statements/{queryId}`` and dispatches on the
+        status code (200 → result ready, 202 → still running). 2xx
+        responses pass through; 4xx/5xx are mapped to typed
+        exceptions by :meth:`_handle_status` exactly like ``post``.
+        """
+        endpoint = f"{self._base_url}{path}"
+        request_id = new_request_id()
+        headers = self._build_headers(accept=accept, request_id=request_id)
+
+        _logger.debug(
+            "GET %s accept=%s stream=%s req_id=%s",
+            endpoint,
+            accept,
+            stream,
+            request_id,
+        )
+        started = time.monotonic()
+        try:
+            response = self._session.get(
+                endpoint,
+                headers=headers,
+                timeout=(self._connect_timeout, timeout_seconds),
+                stream=stream,
+            )
+        except requests.RequestException as ex:
+            _logger.warning(
+                "GET %s failed transport req_id=%s err=%s",
+                endpoint,
+                request_id,
+                ex,
+            )
+            raise TransportError(
+                f"Cannot reach lakehouse provider {endpoint}: {ex}",
+            ) from ex
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _logger.debug(
+            "GET %s status=%s elapsed_ms=%s req_id=%s",
+            endpoint,
+            response.status_code,
+            elapsed_ms,
+            request_id,
+        )
+        return self._handle_status(response, endpoint, request_id)
+
     def post(
         self,
         path: str,
