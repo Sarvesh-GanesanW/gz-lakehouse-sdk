@@ -695,6 +695,44 @@ def test_chunk_byte_estimate_inline_declared_compressed_wins() -> None:
 
 
 @responses.activate
+def test_done_event_executor_field_lands_on_timings() -> None:
+    """The ``executor`` field on the ``done`` event surfaces in timings."""
+    table = pa.table({"id": pa.array([1], type=pa.int64())})
+    body = (
+        b'{"type":"schema","columns":'
+        b'[{"columnName":"id","dataType":"BIGINT"}]}\n'
+        b'{"type":"chunk","url":"'
+        + S3_URL_TEMPLATE.format(0).encode()
+        + b'"}\n'
+        b'{"type":"done","totalRecords":1,"executor":"pyiceberg"}\n'
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        body=body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body=_arrow_ipc_bytes(table),
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        outcome = transport.execute(SESSION_ID, "SELECT 1")
+    finally:
+        transport.close()
+        http.close()
+
+    assert outcome.timings.executor == "pyiceberg"
+
+
+@responses.activate
 def test_ndjson_malformed_line_raises_transport_error() -> None:
     """Corrupt NDJSON lines surface as ``TransportError``, not silent drop."""
     body = (

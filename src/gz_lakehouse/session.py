@@ -543,16 +543,27 @@ def _merge_timings(
     the *max* across legs since legs run in parallel — the slowest leg
     bounds total wall time on each phase. Volume fields
     (``chunk_count`` and byte counters) sum across legs, since they
-    measure aggregate throughput rather than wall time.
+    measure aggregate throughput rather than wall time. ``executor``
+    surfaces a single value when every leg used the same engine, or
+    ``"mixed"`` when legs split between paths (e.g. some legs landed
+    on the fast path and some fell back to Spark).
     """
     if not timings:
         return None
+    distinct_executors = {t.executor for t in timings if t.executor}
+    if len(distinct_executors) == 0:
+        merged_executor: str | None = None
+    elif len(distinct_executors) == 1:
+        merged_executor = next(iter(distinct_executors))
+    else:
+        merged_executor = "mixed"
     return TransportTimings(
         submit_seconds=max(t.submit_seconds for t in timings),
         download_seconds=max(t.download_seconds for t in timings),
         chunk_count=sum(t.chunk_count for t in timings),
         compressed_bytes=sum(t.compressed_bytes for t in timings),
         uncompressed_bytes=sum(t.uncompressed_bytes for t in timings),
+        executor=merged_executor,
     )
 
 
