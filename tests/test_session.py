@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 import pyarrow as pa
@@ -18,6 +20,7 @@ from gz_lakehouse import (
 )
 from gz_lakehouse.session import (
     _compose_partitioned_sql,
+    _render_literal,
     _validate_partition_template,
 )
 
@@ -212,6 +215,46 @@ def test_iter_batches_split_with_explicit_bounds() -> None:
             rows.extend(batch.column("id").to_pylist())
 
     assert sorted(rows) == [1, 2, 3, 4, 5, 6]
+
+
+def test_render_literal_renders_native_types() -> None:
+    """Numbers, bool, None, and strings render with the right SQL syntax."""
+    assert _render_literal(42) == "42"
+    assert _render_literal(3.14) == "3.14"
+    assert _render_literal(True) == "TRUE"
+    assert _render_literal(False) == "FALSE"
+    assert _render_literal(None) == "NULL"
+    assert _render_literal("plain") == "'plain'"
+
+
+def test_render_literal_escapes_single_quotes_ansi_correctly() -> None:
+    """Single quotes double up so the literal cannot break out."""
+    assert _render_literal("O'Brien") == "'O''Brien'"
+    assert _render_literal("'; DROP TABLE x; --") == "'''; DROP TABLE x; --'"
+
+
+def test_render_literal_renders_decimal_unquoted() -> None:
+    """Decimal renders as a numeric literal, not a string."""
+    assert _render_literal(Decimal("123.45")) == "123.45"
+
+
+def test_render_literal_renders_dates_and_timestamps() -> None:
+    """date and datetime render with typed SQL literal syntax."""
+    assert _render_literal(date(2025, 1, 15)) == "DATE '2025-01-15'"
+    assert (
+        _render_literal(datetime(2025, 1, 15, 12, 30, 45))
+        == "TIMESTAMP '2025-01-15 12:30:45'"
+    )
+
+
+def test_render_literal_rejects_unsupported_types() -> None:
+    """Bytes / lists / dicts have no SQL representation; reject loudly."""
+    with pytest.raises(QueryValidationError):
+        _render_literal(b"raw")
+    with pytest.raises(QueryValidationError):
+        _render_literal([1, 2, 3])
+    with pytest.raises(QueryValidationError):
+        _render_literal({"key": "value"})
 
 
 @responses.activate

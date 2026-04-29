@@ -86,6 +86,48 @@ _S3_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 _CHUNK_BACKOFF_CEILING_SECONDS = 30.0
 
 
+class _IterBytesReader(io.RawIOBase):
+    """Adapt an ``Iterator[bytes]`` into a ``read(n)``-style file object.
+
+    pyarrow's :class:`pyarrow.ipc.RecordBatchStreamReader` reads the IPC
+    stream by asking for specific byte counts, but httpx streaming
+    yields whatever frame size the underlying TCP / h2 layer hands
+    back. This adapter maintains a small overflow buffer so a tiny
+    ``read(8)`` call after a 64 KB iter chunk does not throw away the
+    remainder of that chunk. Used by the HTTP/2 chunk download path
+    so the IPC reader can pull bytes off the wire incrementally
+    instead of waiting for ``response.content`` to materialise the
+    whole body in memory.
+    """
+
+    def __init__(self, source: Iterator[bytes]) -> None:
+        """Wrap a byte iterator with a residual buffer."""
+        super().__init__()
+        self._source = source
+        self._residual = b""
+        self._exhausted = False
+
+    def readable(self) -> bool:
+        """Always readable; pyarrow checks this before reading."""
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        """Fill ``buffer`` with up to ``len(buffer)`` bytes from source."""
+        target = len(buffer)
+        if target == 0:
+            return 0
+        while len(self._residual) < target and not self._exhausted:
+            try:
+                self._residual += next(self._source)
+            except StopIteration:
+                self._exhausted = True
+                break
+        emit = min(target, len(self._residual))
+        buffer[:emit] = self._residual[:emit]
+        self._residual = self._residual[emit:]
+        return emit
+
+
 class _RetryableChunkError(Exception):
     """Internal sentinel: chunk download failed in a way worth retrying.
 
@@ -861,49 +903,50 @@ class Transport:
         self,
         chunk: dict[str, Any],
     ) -> pa.Table:
-        """Fetch a chunk over the httpx HTTP/2 client.
+        """Fetch a chunk over the httpx HTTP/2 client, streaming.
 
-        Buffers the body in memory (chunks are typically 20 MB so
-        peak overhead is bounded by ``parallel_workers * chunk_bytes``)
-        then parses the Arrow IPC stream from a ``BytesIO``. The
-        single-connection multiplex over HTTP/2 saves one TLS
-        handshake and TCP slow-start per concurrent chunk.
+        Streams the body from the wire into a pyarrow IPC reader via
+        an :class:`_IterBytesReader` adapter so peak memory per chunk
+        stays at the IPC reader's internal buffer plus the in-flight
+        TCP frame, instead of double-buffering the full chunk in
+        ``response.content`` *and* a ``BytesIO``. With 32 workers ×
+        64 MB chunks the old path peaked at ~2 GB; this one peaks
+        only at the IPC reader's working set.
         """
         assert self._s3_http2_client is not None
         url = chunk["url"]
         url_preview = _truncate_url(url)
         started = time.monotonic()
         try:
-            response = self._s3_http2_client.get(url)
+            with self._s3_http2_client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    response.read()
+                    body_preview = (
+                        response.text[:256] if response.content else ""
+                    )
+                    if response.status_code in _S3_RETRYABLE_STATUS:
+                        raise _RetryableChunkError(
+                            f"HTTP {response.status_code} from S3 "
+                            f"({url_preview}): {body_preview}",
+                        )
+                    raise QueryExecutionError(
+                        f"Failed to fetch result chunk {url_preview} "
+                        f"(HTTP {response.status_code}): {body_preview}",
+                    )
+                try:
+                    reader = paipc.RecordBatchStreamReader(
+                        _IterBytesReader(response.iter_bytes()),
+                    )
+                    table = reader.read_all()
+                except (pa.ArrowInvalid, pa.ArrowIOError) as ex:
+                    raise _RetryableChunkError(
+                        f"chunk {url_preview} parse failed "
+                        f"(likely truncated body): {ex}",
+                        cause=ex,
+                    ) from ex
         except httpx.HTTPError as ex:
             raise _RetryableChunkError(
                 f"transport error fetching chunk {url_preview}: {ex}",
-                cause=ex,
-            ) from ex
-
-        try:
-            if response.status_code != 200:
-                body_preview = response.text[:256] if response.content else ""
-                if response.status_code in _S3_RETRYABLE_STATUS:
-                    raise _RetryableChunkError(
-                        f"HTTP {response.status_code} from S3 "
-                        f"({url_preview}): {body_preview}",
-                    )
-                raise QueryExecutionError(
-                    f"Failed to fetch result chunk {url_preview} "
-                    f"(HTTP {response.status_code}): {body_preview}",
-                )
-            body = response.content
-        finally:
-            response.close()
-
-        try:
-            reader = paipc.RecordBatchStreamReader(io.BytesIO(body))
-            table = reader.read_all()
-        except (pa.ArrowInvalid, pa.ArrowIOError) as ex:
-            raise _RetryableChunkError(
-                f"chunk {url_preview} parse failed "
-                f"(likely truncated body): {ex}",
                 cause=ex,
             ) from ex
 
