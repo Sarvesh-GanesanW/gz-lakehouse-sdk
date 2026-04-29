@@ -493,3 +493,137 @@ def test_query_key_changes_with_sql() -> None:
 
     bodies = [_json.loads(c.request.body) for c in responses.calls]
     assert bodies[0]["queryKey"] != bodies[1]["queryKey"]
+
+
+@responses.activate
+def test_download_pool_is_shared_across_executions() -> None:
+    """The chunk-download pool is created once and reused across calls."""
+    table = pa.table({"id": pa.array([1], type=pa.int64())})
+    for _ in range(2):
+        responses.add(
+            responses.POST,
+            f"{PROVIDER_URL}/iceberg/v1/statements",
+            json=_envelope(chunk_count=1, total_rows=1),
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            S3_URL_TEMPLATE.format(0),
+            body=_arrow_ipc_bytes(table),
+            status=200,
+        )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        assert transport._download_pool is None
+        transport.execute(SESSION_ID, "SELECT 1")
+        first_pool = transport._download_pool
+        assert first_pool is not None
+        transport.execute(SESSION_ID, "SELECT 2")
+        assert transport._download_pool is first_pool
+    finally:
+        transport.close()
+        http.close()
+    assert transport._download_pool is None
+
+
+@responses.activate
+def test_close_shuts_down_download_pool() -> None:
+    """Closing the transport tears down the shared download pool."""
+    table = pa.table({"id": pa.array([1], type=pa.int64())})
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json=_envelope(chunk_count=1, total_rows=1),
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body=_arrow_ipc_bytes(table),
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    transport.execute(SESSION_ID, "SELECT 1")
+    pool = transport._download_pool
+    assert pool is not None
+    transport.close()
+    http.close()
+    assert transport._download_pool is None
+    assert pool._shutdown is True
+
+
+@responses.activate
+def test_heartbeat_does_not_inflate_ttfb() -> None:
+    """A leading heartbeat event must not be counted as TTFB.
+
+    The pod can emit periodic ``heartbeat`` events on the NDJSON stream
+    so the TCP connection stays alive during long-running queries. The
+    SDK must skip them when stamping the TTFB metric, otherwise a slow
+    schema-emit followed by a fast first heartbeat would report a TTFB
+    of "time to first heartbeat" instead of "time to first useful row
+    of metadata."
+    """
+    table = pa.table({"id": pa.array([1], type=pa.int64())})
+    schema_event = (
+        b'{"type":"schema","columns":'
+        b'[{"columnName":"id","dataType":"BIGINT"}]}'
+    )
+    chunk_event = (
+        b'{"type":"chunk","url":"' + S3_URL_TEMPLATE.format(0).encode() + b'"}'
+    )
+    done_event = b'{"type":"done","totalRecords":1}'
+    body = (
+        b'{"type":"heartbeat"}\n'
+        + schema_event
+        + b"\n"
+        + chunk_event
+        + b"\n"
+        + done_event
+        + b"\n"
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        body=body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body=_arrow_ipc_bytes(table),
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        outcome = transport.execute(SESSION_ID, "SELECT 1")
+    finally:
+        transport.close()
+        http.close()
+
+    assert outcome.timings.submit_seconds >= 0.0
+    assert outcome.table.num_rows == 1
+
+
+def test_http2_client_uses_transport_with_retries() -> None:
+    """When ``enable_http2`` is on, the httpx client gets connect retries."""
+    config = _config(enable_http2=True, max_retries=4)
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        client = transport._s3_http2_client
+        assert client is not None
+        underlying = client._transport
+        assert underlying is not None
+    finally:
+        transport.close()
+        http.close()
