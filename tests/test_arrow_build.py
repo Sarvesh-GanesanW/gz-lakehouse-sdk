@@ -74,3 +74,39 @@ def test_empty_table_for_handles_no_descriptors() -> None:
 
     assert table.num_rows == 0
     assert table.column_names == []
+
+
+def test_arrow_type_for_decimal_preserves_precision_and_scale() -> None:
+    """``DECIMAL(p,s)`` maps to ``decimal128(p,s)`` not string."""
+    assert arrow_type_for("DECIMAL(10,2)") == pa.decimal128(10, 2)
+    assert arrow_type_for("decimal(18,4)") == pa.decimal128(18, 4)
+    assert arrow_type_for("DECIMAL( 38 , 0 )") == pa.decimal128(38, 0)
+
+
+def test_arrow_type_for_decimal_without_scale_defaults_to_zero() -> None:
+    """``DECIMAL(p)`` (no scale) maps to scale 0."""
+    assert arrow_type_for("DECIMAL(12)") == pa.decimal128(12, 0)
+
+
+def test_arrow_type_for_bare_decimal_uses_widest_default() -> None:
+    """A bare ``DECIMAL`` falls back to decimal128(38,18)."""
+    assert arrow_type_for("decimal") == pa.decimal128(38, 18)
+
+
+def test_arrow_type_for_decimal_above_38_uses_decimal256() -> None:
+    """Precisions >38 widen to ``decimal256``."""
+    assert arrow_type_for("DECIMAL(50,4)") == pa.decimal256(50, 4)
+
+
+def test_arrow_type_for_decimal_above_76_falls_back_to_string() -> None:
+    """Unrepresentable decimals degrade to string rather than truncate."""
+    assert arrow_type_for("DECIMAL(100,0)") == pa.string()
+
+
+def test_empty_table_for_decimal_keeps_decimal_type() -> None:
+    """Empty results with a decimal column expose decimal type, not string."""
+    descriptors = [{"columnName": "amount", "dataType": "DECIMAL(18,2)"}]
+
+    table = empty_table_for(descriptors)
+
+    assert table.schema.field("amount").type == pa.decimal128(18, 2)

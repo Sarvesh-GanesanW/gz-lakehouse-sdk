@@ -11,6 +11,8 @@ and (b) translate an Arrow schema back into the
 
 from __future__ import annotations
 
+import re
+
 import pyarrow as pa
 
 _TYPE_MAP: dict[str, pa.DataType] = {
@@ -47,6 +49,12 @@ _TYPE_MAP: dict[str, pa.DataType] = {
 }
 
 
+_DECIMAL_PATTERN = re.compile(
+    r"decimal\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)",
+    re.IGNORECASE,
+)
+
+
 def arrow_type_for(data_type: str | None) -> pa.DataType:
     """Map a provider ``dataType`` string to a :class:`pyarrow.DataType`.
 
@@ -58,6 +66,14 @@ def arrow_type_for(data_type: str | None) -> pa.DataType:
     so empty-result schema preservation works regardless of which side
     produced the descriptor.
 
+    Decimal types preserve their precision and scale: ``DECIMAL(10,2)``
+    maps to ``pa.decimal128(10, 2)`` instead of degrading to ``string``,
+    so empty-result downstream consumers (pandas, Spark) keep numeric
+    semantics. Precisions above 38 widen to ``pa.decimal256``;
+    precisions above 76 (un-representable in Arrow) fall back to
+    ``string`` since silently truncating precision is worse than
+    surfacing a type mismatch.
+
     Args:
         data_type: Provider-supplied type string. ``None`` and unknown
             types fall back to ``string`` so the caller never has to
@@ -66,11 +82,34 @@ def arrow_type_for(data_type: str | None) -> pa.DataType:
     if not data_type:
         return pa.string()
     normalised = data_type.strip().lower()
+    if normalised.startswith("decimal"):
+        return _decimal_type_for(data_type)
     normalised = normalised.split("(", 1)[0]
     normalised = normalised.split("[", 1)[0]
-    if normalised.startswith("decimal"):
-        return pa.string()
     return _TYPE_MAP.get(normalised, pa.string())
+
+
+def _decimal_type_for(data_type: str) -> pa.DataType:
+    """Parse ``decimal(p,s)`` into a precise Arrow decimal type.
+
+    A bare ``decimal`` without precision falls back to
+    ``decimal128(38, 18)`` — the widest decimal128 with a reasonable
+    scale, matching what Iceberg/Spark emit for un-annotated DECIMAL.
+    Precisions above what Arrow can represent (>76) degrade to
+    string so the SDK never silently rounds the value space.
+    """
+    match = _DECIMAL_PATTERN.search(data_type)
+    if not match:
+        return pa.decimal128(38, 18)
+    precision = int(match.group(1))
+    scale = int(match.group(2) or 0)
+    if precision < 1:
+        return pa.string()
+    if precision <= 38:
+        return pa.decimal128(precision, scale)
+    if precision <= 76:
+        return pa.decimal256(precision, scale)
+    return pa.string()
 
 
 def schema_to_descriptors(schema: pa.Schema) -> list[dict[str, str]]:

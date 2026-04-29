@@ -13,7 +13,12 @@ import responses
 from gz_lakehouse import (
     LakehouseClient,
     LakehouseConfig,
+    QueryExecutionError,
     QueryValidationError,
+)
+from gz_lakehouse.session import (
+    _compose_partitioned_sql,
+    _validate_partition_template,
 )
 
 PROVIDER_URL = "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
@@ -233,3 +238,187 @@ def test_iter_batches_split_validates_inputs() -> None:
                     bounds=(0, 10),
                 ),
             )
+
+
+def test_compose_partitioned_sql_appends_where_when_absent() -> None:
+    """Bare SELECT gets a ``WHERE`` appended."""
+    composed = _compose_partitioned_sql(
+        "SELECT id FROM orders",
+        "id",
+        1,
+        100,
+    )
+    assert composed == "SELECT id FROM orders WHERE id BETWEEN 1 AND 100"
+
+
+def test_compose_partitioned_sql_appends_and_with_outer_where() -> None:
+    """An existing outer ``WHERE`` causes ``AND`` instead."""
+    composed = _compose_partitioned_sql(
+        "SELECT id FROM orders WHERE region = 'US'",
+        "id",
+        1,
+        100,
+    )
+    assert composed == (
+        "SELECT id FROM orders WHERE region = 'US' AND id BETWEEN 1 AND 100"
+    )
+
+
+def test_compose_partitioned_sql_ignores_where_in_string_literal() -> None:
+    """A ``WHERE`` substring inside a literal must not trigger AND-mode."""
+    composed = _compose_partitioned_sql(
+        "SELECT 'WHERE NOT' AS msg, id FROM t",
+        "id",
+        1,
+        2,
+    )
+    assert composed == (
+        "SELECT 'WHERE NOT' AS msg, id FROM t WHERE id BETWEEN 1 AND 2"
+    )
+
+
+def test_compose_partitioned_sql_ignores_where_inside_subquery() -> None:
+    """An inner subquery WHERE doesn't trigger AND on the outer query."""
+    composed = _compose_partitioned_sql(
+        "SELECT id FROM (SELECT id FROM raw WHERE valid) sub",
+        "id",
+        1,
+        2,
+    )
+    assert composed == (
+        "SELECT id FROM (SELECT id FROM raw WHERE valid) sub "
+        "WHERE id BETWEEN 1 AND 2"
+    )
+
+
+def test_validate_partition_template_rejects_outer_order_by() -> None:
+    """Outer ORDER BY is rejected so composition produces no broken SQL."""
+    with pytest.raises(QueryValidationError, match="ORDER BY"):
+        _validate_partition_template(
+            "SELECT id FROM t ORDER BY id",
+        )
+
+
+def test_validate_partition_template_rejects_outer_limit() -> None:
+    """Outer LIMIT is rejected."""
+    with pytest.raises(QueryValidationError, match="LIMIT"):
+        _validate_partition_template("SELECT id FROM t LIMIT 10")
+
+
+def test_validate_partition_template_rejects_set_operator() -> None:
+    """UNION at the outer level is rejected (composition would break)."""
+    with pytest.raises(QueryValidationError, match="UNION"):
+        _validate_partition_template(
+            "SELECT id FROM a UNION SELECT id FROM b",
+        )
+
+
+def test_validate_partition_template_allows_clause_inside_subquery() -> None:
+    """ORDER BY inside a CTE / subquery is fine — only outer-level rejected."""
+    _validate_partition_template(
+        "SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 10) sub",
+    )
+
+
+def test_validate_partition_template_allows_keyword_in_literal() -> None:
+    """``LIMIT`` inside a literal must not trigger validation."""
+    _validate_partition_template(
+        "SELECT id, 'LIMIT 10 mention' AS note FROM t",
+    )
+
+
+@responses.activate
+def test_query_parallel_rejects_outer_order_by() -> None:
+    """``query_parallel`` validates the template before going over wire."""
+    _stub_session_lifecycle()
+
+    with (
+        LakehouseClient(_config()) as client,
+        client.start_session() as s,
+        pytest.raises(QueryValidationError, match="ORDER BY"),
+    ):
+        s.query_parallel(
+            sql_template="SELECT id FROM t ORDER BY id",
+            partition_column="id",
+            bounds=[(0, 10)],
+        )
+
+
+@responses.activate
+def test_query_parallel_merges_timings_across_partitions() -> None:
+    """``QueryResult.timings`` is populated and aggregates across legs."""
+    _stub_session_lifecycle()
+    for value in (1, 2):
+        responses.add(
+            responses.POST,
+            f"{PROVIDER_URL}/iceberg/v1/statements",
+            json={
+                "schema": [{"columnName": "id", "dataType": "BIGINT"}],
+                "totalRecords": 1,
+                "hasMore": False,
+                "chunks": [
+                    {
+                        "url": S3_URL_TEMPLATE.format(value),
+                        "compressedSize": 100,
+                        "uncompressedSize": 200,
+                    },
+                ],
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            S3_URL_TEMPLATE.format(value),
+            body=_arrow_ipc_bytes(
+                pa.table({"id": pa.array([value], type=pa.int64())}),
+            ),
+            status=200,
+        )
+
+    with LakehouseClient(_config()) as client, client.start_session() as s:
+        result = s.query_parallel(
+            sql_template="SELECT id FROM t",
+            partition_column="id",
+            bounds=[(1, 1), (2, 2)],
+            max_workers=2,
+        )
+
+    assert result.timings is not None
+    assert result.timings.chunk_count == 2
+    assert result.timings.compressed_bytes == 200
+    assert result.timings.uncompressed_bytes == 400
+
+
+@responses.activate
+def test_query_parallel_fail_fast_propagates_first_error() -> None:
+    """A failing partition surfaces; the others are cancelled / discarded."""
+    _stub_session_lifecycle()
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={"status": "error", "message": "boom"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={
+            "schema": [],
+            "totalRecords": 0,
+            "hasMore": False,
+            "chunks": [],
+        },
+        status=200,
+    )
+
+    with (
+        LakehouseClient(_config()) as client,
+        client.start_session() as s,
+        pytest.raises(QueryExecutionError, match="boom"),
+    ):
+        s.query_parallel(
+            sql_template="SELECT id FROM t",
+            partition_column="id",
+            bounds=[(1, 1), (2, 2)],
+            max_workers=2,
+        )

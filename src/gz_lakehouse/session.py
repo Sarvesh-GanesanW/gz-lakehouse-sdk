@@ -25,15 +25,17 @@ time.
 from __future__ import annotations
 
 import queue
+import re
 import threading
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
 from gz_lakehouse._logging import get_logger
+from gz_lakehouse._transport import TransportTimings
 from gz_lakehouse.exceptions import (
     QueryExecutionError,
     QueryValidationError,
@@ -41,12 +43,31 @@ from gz_lakehouse.exceptions import (
 from gz_lakehouse.result import QueryResult
 
 if TYPE_CHECKING:
-    from gz_lakehouse._transport import ExecutorChoice, Transport
+    from gz_lakehouse._transport import (
+        ExecutorChoice,
+        Transport,
+        TransportResult,
+    )
     from gz_lakehouse.config import LakehouseConfig
     from gz_lakehouse.pipeline_config import PipelineConfig
 
 _SPLIT_QUEUE_DEPTH_PER_THREAD = 4
 _SPLIT_THREAD_JOIN_TIMEOUT = 5.0
+
+_SQL_LITERAL_PATTERN = re.compile(r"'(?:''|[^'])*'")
+
+_FORBIDDEN_OUTER_CLAUSES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ORDER BY", re.compile(r"\bORDER\s+BY\b")),
+    ("GROUP BY", re.compile(r"\bGROUP\s+BY\b")),
+    ("HAVING", re.compile(r"\bHAVING\b")),
+    ("LIMIT", re.compile(r"\bLIMIT\b")),
+    ("OFFSET", re.compile(r"\bOFFSET\b")),
+    ("FETCH", re.compile(r"\bFETCH\b")),
+    ("UNION", re.compile(r"\bUNION\b")),
+    ("INTERSECT", re.compile(r"\bINTERSECT\b")),
+    ("EXCEPT", re.compile(r"\bEXCEPT\b")),
+)
+_WHERE_PATTERN = re.compile(r"\bWHERE\b")
 
 _logger = get_logger("session")
 
@@ -189,6 +210,7 @@ class Session:
             raise QueryValidationError(
                 "iter_batches_split requires a non-empty split_by column",
             )
+        _validate_partition_template(sql)
 
         resolved_bounds = bounds or self._probe_split_bounds(sql, split_by)
         low, high = resolved_bounds
@@ -270,6 +292,7 @@ class Session:
             )
         self._validate_sql(sql_template)
         self._ensure_open()
+        _validate_partition_template(sql_template)
 
         statements = [
             _compose_partitioned_sql(sql_template, partition_column, low, high)
@@ -282,28 +305,69 @@ class Session:
             workers,
             self._session_id,
         )
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            outcomes = list(
-                pool.map(
-                    lambda sql: self._transport.execute(
-                        self._session_id,
-                        sql,
-                    ),
-                    statements,
-                ),
-            )
+        outcomes = self._run_parallel_statements(statements, workers)
 
         tables = [outcome.table for outcome in outcomes]
         combined = pa.concat_tables(tables, promote_options="default")
         truncated = any(outcome.truncated for outcome in outcomes)
         total_rows = sum(outcome.total_rows for outcome in outcomes)
         schema = outcomes[0].schema if outcomes else []
+        merged_timings = _merge_timings(
+            [outcome.timings for outcome in outcomes],
+        )
         return QueryResult(
             table=combined,
             schema=schema,
             truncated=truncated,
             total_rows=total_rows,
+            timings=merged_timings,
         )
+
+    def _run_parallel_statements(
+        self,
+        statements: Sequence[str],
+        workers: int,
+    ) -> list[TransportResult]:
+        """Submit ``statements`` concurrently with fail-fast cancellation.
+
+        Submits all statements up front, then drains in completion order
+        so a fast-failing partition surfaces immediately rather than
+        waiting for the slowest leg. On the first failure, every
+        not-yet-running future is cancelled and the pool is shut down
+        with ``cancel_futures=True`` so the user does not pay for
+        downloads that will be discarded. Outcomes are returned in
+        submission order so concatenation is stable across runs.
+        """
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="sdk-parallel",
+        ) as pool:
+            futures: list[Future[TransportResult]] = [
+                pool.submit(
+                    self._transport.execute,
+                    self._session_id,
+                    sql,
+                )
+                for sql in statements
+            ]
+            future_index = {f: i for i, f in enumerate(futures)}
+            results: list[TransportResult | None] = [None] * len(futures)
+            failure: BaseException | None = None
+            for completed in as_completed(futures):
+                if failure is not None:
+                    completed.cancel()
+                    continue
+                try:
+                    results[future_index[completed]] = completed.result()
+                except BaseException as ex:
+                    failure = ex
+                    for pending in futures:
+                        if pending is not completed:
+                            pending.cancel()
+            if failure is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise failure
+        return [outcome for outcome in results if outcome is not None]
 
     def stop(self) -> None:
         """Tear down the session pod. Safe to call multiple times."""
@@ -343,18 +407,77 @@ class Session:
             )
 
 
+def _strip_sql_literals(sql: str) -> str:
+    """Replace single-quoted string literals with empty quotes.
+
+    Lets keyword scanning ignore literals that *contain* SQL keywords —
+    a column value of ``'WHERE NOT FOUND'`` must not register as a
+    real ``WHERE`` clause.
+    """
+    return _SQL_LITERAL_PATTERN.sub("''", sql)
+
+
+def _is_at_depth_zero(stripped_upper: str, position: int) -> bool:
+    """Return True when ``position`` is outside any parenthesised group."""
+    depth = 0
+    for ch in stripped_upper[:position]:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+    return depth == 0
+
+
+def _has_outer_match(stripped_upper: str, pattern: re.Pattern[str]) -> bool:
+    """Return True when ``pattern`` matches at outermost paren depth."""
+    return any(
+        _is_at_depth_zero(stripped_upper, m.start())
+        for m in pattern.finditer(stripped_upper)
+    )
+
+
+def _validate_partition_template(sql: str) -> None:
+    """Reject templates the SDK cannot safely append a WHERE/AND to.
+
+    Outer-level ORDER BY / GROUP BY / HAVING / LIMIT / OFFSET / FETCH
+    and set operators (UNION / INTERSECT / EXCEPT) all conflict with
+    appending a partition predicate. The SDK rejects these instead of
+    silently producing broken SQL — wrap the query as a subquery if
+    you need them: ``SELECT * FROM (<your sql>) AS sub``.
+
+    Inside parenthesised subqueries / CTEs these clauses are fine; the
+    depth-aware scanner only flags them at the outermost level.
+    """
+    stripped_upper = _strip_sql_literals(sql).upper()
+    for label, pattern in _FORBIDDEN_OUTER_CLAUSES:
+        if _has_outer_match(stripped_upper, pattern):
+            raise QueryValidationError(
+                f"Partition template must not contain a top-level "
+                f"{label} clause: the SDK appends a WHERE/AND for the "
+                f"partition column. Wrap as a subquery if needed: "
+                f"SELECT * FROM (<your sql>) AS sub",
+            )
+
+
 def _compose_partitioned_sql(
     sql_template: str,
     partition_column: str,
     low: Any,
     high: Any,
 ) -> str:
-    """Append ``WHERE col BETWEEN low AND high`` to ``sql_template``."""
+    """Append ``WHERE col BETWEEN low AND high`` to ``sql_template``.
+
+    Uses depth-aware WHERE detection so a ``WHERE`` inside a CTE or
+    subquery doesn't trigger AND-mode for the outer clause, and
+    string literals containing the substring ``WHERE`` don't false-match.
+    Callers should run :func:`_validate_partition_template` first to
+    reject templates with terminal clauses that would break composition.
+    """
     rendered_low = _render_literal(low)
     rendered_high = _render_literal(high)
     clause = f"{partition_column} BETWEEN {rendered_low} AND {rendered_high}"
-    upper = sql_template.upper()
-    if " WHERE " in f" {upper} ":
+    stripped_upper = _strip_sql_literals(sql_template).upper()
+    if _has_outer_match(stripped_upper, _WHERE_PATTERN):
         return f"{sql_template} AND {clause}"
     return f"{sql_template} WHERE {clause}"
 
@@ -369,6 +492,28 @@ def _render_literal(value: Any) -> str:
         return "NULL"
     escaped = str(value).replace("'", "''")
     return f"'{escaped}'"
+
+
+def _merge_timings(
+    timings: Sequence[TransportTimings],
+) -> TransportTimings | None:
+    """Merge per-statement timings into one aggregate for fan-out queries.
+
+    Wall-clock fields (``submit_seconds``, ``download_seconds``) take
+    the *max* across legs since legs run in parallel — the slowest leg
+    bounds total wall time on each phase. Volume fields
+    (``chunk_count`` and byte counters) sum across legs, since they
+    measure aggregate throughput rather than wall time.
+    """
+    if not timings:
+        return None
+    return TransportTimings(
+        submit_seconds=max(t.submit_seconds for t in timings),
+        download_seconds=max(t.download_seconds for t in timings),
+        chunk_count=sum(t.chunk_count for t in timings),
+        compressed_bytes=sum(t.compressed_bytes for t in timings),
+        uncompressed_bytes=sum(t.uncompressed_bytes for t in timings),
+    )
 
 
 def _build_split_sqls(
