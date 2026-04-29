@@ -50,7 +50,7 @@ _TYPE_MAP: dict[str, pa.DataType] = {
 
 
 _DECIMAL_PATTERN = re.compile(
-    r"decimal\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)",
+    r"decimal(?:type|128|256)?\s*\(\s*(\d+)\s*(?:,\s*(\d+))?\s*\)",
     re.IGNORECASE,
 )
 
@@ -90,11 +90,23 @@ def arrow_type_for(data_type: str | None) -> pa.DataType:
 
 
 def _decimal_type_for(data_type: str) -> pa.DataType:
-    """Parse ``decimal(p,s)`` into a precise Arrow decimal type.
+    """Parse a decimal type string into a precise Arrow decimal type.
+
+    Accepts every form the GroundZero pod / provider has been seen to
+    emit:
+
+    * ``"DECIMAL(p,s)"`` and ``"decimal(p,s)"`` — Iceberg / Trino /
+      ANSI SQL textual form.
+    * ``"DecimalType(p,s)"`` — what
+      ``str(pyspark.sql.types.DecimalType(p, s))`` produces; emitted
+      by the Spark-path schema descriptor builder.
+    * ``"decimal128(p, s)"`` / ``"decimal256(p, s)"`` — what
+      ``str(pa.decimal128(p, s))`` produces; emitted by the fast-path
+      (PyIceberg → Arrow) descriptor builder.
 
     A bare ``decimal`` without precision falls back to
     ``decimal128(38, 18)`` — the widest decimal128 with a reasonable
-    scale, matching what Iceberg/Spark emit for un-annotated DECIMAL.
+    scale, matching what Iceberg / Spark emit for un-annotated DECIMAL.
     Precisions above what Arrow can represent (>76) degrade to
     string so the SDK never silently rounds the value space.
     """

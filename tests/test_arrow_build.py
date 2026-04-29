@@ -110,3 +110,20 @@ def test_empty_table_for_decimal_keeps_decimal_type() -> None:
     table = empty_table_for(descriptors)
 
     assert table.schema.field("amount").type == pa.decimal128(18, 2)
+
+
+def test_arrow_type_for_pyspark_decimaltype_form() -> None:
+    """``DecimalType(p,s)`` (PySpark ``str()`` form) parses correctly."""
+    assert arrow_type_for("DecimalType(18,2)") == pa.decimal128(18, 2)
+    assert arrow_type_for("DecimalType(38,0)") == pa.decimal128(38, 0)
+
+
+def test_arrow_type_for_arrow_native_decimal128_form() -> None:
+    """``decimal128(p, s)`` (``pa.decimal128`` ``str()`` form) parses."""
+    assert arrow_type_for("decimal128(18, 2)") == pa.decimal128(18, 2)
+    assert arrow_type_for("decimal128(10, 0)") == pa.decimal128(10, 0)
+
+
+def test_arrow_type_for_arrow_native_decimal256_form() -> None:
+    """``decimal256(p, s)`` (``pa.decimal256`` ``str()`` form) parses."""
+    assert arrow_type_for("decimal256(50, 4)") == pa.decimal256(50, 4)
