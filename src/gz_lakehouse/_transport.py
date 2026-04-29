@@ -39,18 +39,17 @@ typically lands in 2–3 seconds on a 1 Gb/s link.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
+import random
 import time
 from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Literal
 
-
-ExecutorChoice = Literal["auto", "fast", "spark"]
-_VALID_EXECUTORS = ("auto", "fast", "spark")
-
+import httpx
 import pyarrow as pa
 import pyarrow.ipc as paipc
 import requests
@@ -69,6 +68,9 @@ from gz_lakehouse.exceptions import (
 )
 from gz_lakehouse.pipeline_config import PipelineConfig
 
+ExecutorChoice = Literal["auto", "fast", "spark"]
+_VALID_EXECUTORS = ("auto", "fast", "spark")
+
 if TYPE_CHECKING:
     from gz_lakehouse.config import LakehouseConfig
 
@@ -80,6 +82,27 @@ _VERIFY_PATH = "/iceberg/testconnection"
 _DOWNLOAD_BUFFER_BYTES = 1 << 20
 
 _S3_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+_CHUNK_BACKOFF_CEILING_SECONDS = 30.0
+
+
+class _RetryableChunkError(Exception):
+    """Internal sentinel: chunk download failed in a way worth retrying.
+
+    Wraps the underlying exception so the retry loop can preserve the
+    original cause for the final TransportError when all attempts run
+    out. Never escapes the transport module — callers see
+    :class:`TransportError` or :class:`QueryExecutionError` instead.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Hold a human-readable message plus the original exception."""
+        super().__init__(message)
+        self.cause = cause
+
 
 _COMPUTE_SIZE_TO_ID: dict[str, int] = {
     "small": 1003,
@@ -175,6 +198,9 @@ class Transport:
         self._http = http
         self._config = config
         self._s3_session = self._build_s3_session()
+        self._s3_http2_client: httpx.Client | None = (
+            self._build_s3_http2_client() if config.enable_http2 else None
+        )
 
     def execute(
         self,
@@ -195,7 +221,10 @@ class Transport:
         _validate_executor(executor)
         submit_started = time.monotonic()
         event_iter, response = self._open_event_stream(
-            session_id, sql, executor, pipeline,
+            session_id,
+            sql,
+            executor,
+            pipeline,
         )
 
         schema: list[dict[str, str]] = []
@@ -226,8 +255,12 @@ class Transport:
                         pending.append(
                             pool.submit(self._download_chunk, event),
                         )
-                    compressed_bytes += int(event.get("compressedSize") or 0)
-                    uncompressed_bytes += int(event.get("uncompressedSize") or 0)
+                    compressed_bytes += int(
+                        event.get("compressedSize") or 0,
+                    )
+                    uncompressed_bytes += int(
+                        event.get("uncompressedSize") or 0,
+                    )
                 elif etype == "heartbeat":
                     continue
                 elif etype == "done":
@@ -305,7 +338,10 @@ class Transport:
         """
         _validate_executor(executor)
         event_iter, response = self._open_event_stream(
-            session_id, sql, executor, pipeline,
+            session_id,
+            sql,
+            executor,
+            pipeline,
         )
         pending: deque[Future[pa.Table]] = deque()
         pool = ThreadPoolExecutor(
@@ -327,9 +363,7 @@ class Transport:
                     while pending and pending[0].done():
                         table = pending.popleft().result()
                         yield from table.to_batches(max_chunksize=batch_size)
-                elif etype == "heartbeat":
-                    continue
-                elif etype == "schema":
+                elif etype in ("heartbeat", "schema"):
                     continue
                 elif etype == "done":
                     break
@@ -368,7 +402,12 @@ class Transport:
         before return and the generator just walks an in-memory
         envelope.
         """
-        payload = self._build_statement_payload(session_id, sql, executor, pipeline)
+        payload = self._build_statement_payload(
+            session_id,
+            sql,
+            executor,
+            pipeline,
+        )
         response = self._http.post(
             path=_STATEMENTS_PATH,
             json_body=payload,
@@ -405,6 +444,7 @@ class Transport:
                 },
             },
             "query": sql,
+            "queryKey": self._compute_query_key(sql, executor, pipeline),
         }
         if executor != "auto":
             payload["executor"] = executor
@@ -413,6 +453,40 @@ class Transport:
             if wire:
                 payload["pipelineConfig"] = wire
         return payload
+
+    def _compute_query_key(
+        self,
+        sql: str,
+        executor: ExecutorChoice,
+        pipeline: PipelineConfig | None,
+    ) -> str:
+        """Return a stable, deterministic hash of the query inputs.
+
+        Same (sql, warehouse, database, user, compute, executor,
+        pipeline) → same 32-char hex digest, across SDK versions and
+        runs. The server may use this for result caching, request
+        deduplication, or observability correlation; it is safe to
+        ignore on the server side.
+
+        sessionId is intentionally excluded so repeated runs of an
+        identical query against different warm pods share a key.
+        """
+        parts = [
+            sql.strip(),
+            self._config.warehouse,
+            self._config.database,
+            self._config.username,
+            self._config.compute_size,
+            str(self._config.compute_id or 0),
+            str(self._config.minimum_workers),
+            executor,
+        ]
+        if pipeline is not None:
+            wire = pipeline.to_wire()
+            for key in sorted(wire):
+                parts.append(f"{key}={wire[key]}")
+        raw = "\x00".join(parts).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:32]
 
     @staticmethod
     def _iter_ndjson(response: Any) -> Iterator[dict[str, Any]]:
@@ -550,6 +624,9 @@ class Transport:
     def close(self) -> None:
         """Release the dedicated S3 session pool."""
         self._s3_session.close()
+        if self._s3_http2_client is not None:
+            self._s3_http2_client.close()
+            self._s3_http2_client = None
 
     @staticmethod
     def _parse_envelope(envelope: Any) -> _Envelope:
@@ -657,12 +734,63 @@ class Transport:
         return table
 
     def _download_chunk(self, chunk: dict[str, Any]) -> pa.Table:
-        """Fetch a single presigned-URL chunk and parse its Arrow IPC stream.
+        """Fetch a chunk with retries on transient failures.
 
-        Every error is rewrapped with the chunk URL (truncated for log
-        hygiene) so downstream stack traces always identify the
-        offending chunk.
+        Wraps :meth:`_download_chunk_once` in an exponential-backoff
+        retry loop. Connection drops, 5xx/408/429 responses, and
+        partial-body parse failures all retry. Deterministic 4xx
+        (other than 408/429) propagate immediately as
+        :class:`QueryExecutionError` since retrying is wasted effort.
         """
+        url_preview = _truncate_url(chunk["url"])
+        max_attempts = self._config.max_retries + 1
+        last_cause: BaseException | None = None
+        for attempt in range(max_attempts):
+            try:
+                return self._download_chunk_once(chunk)
+            except _RetryableChunkError as ex:
+                last_cause = ex.cause or ex
+                if attempt + 1 >= max_attempts:
+                    _logger.warning(
+                        "chunk %s exhausted retries (%d attempts): %s",
+                        url_preview,
+                        max_attempts,
+                        ex,
+                    )
+                    break
+                delay = self._compute_chunk_backoff(attempt)
+                _logger.warning(
+                    "chunk %s attempt %d/%d failed, retrying in %.2fs: %s",
+                    url_preview,
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                    ex,
+                )
+                time.sleep(delay)
+        raise TransportError(
+            f"Cannot download result chunk {url_preview} after "
+            f"{max_attempts} attempt(s): {last_cause}",
+        ) from last_cause
+
+    def _download_chunk_once(self, chunk: dict[str, Any]) -> pa.Table:
+        """Single attempt at fetching and parsing an Arrow IPC chunk.
+
+        Translates transient failures into :class:`_RetryableChunkError`
+        for the retry wrapper. Deterministic failures (auth, malformed
+        URL) propagate as :class:`QueryExecutionError`. Uses the
+        HTTP/2 client when ``enable_http2`` is set; otherwise falls
+        back to the ``requests``-backed pool.
+        """
+        if self._s3_http2_client is not None:
+            return self._download_chunk_once_http2(chunk)
+        return self._download_chunk_once_requests(chunk)
+
+    def _download_chunk_once_requests(
+        self,
+        chunk: dict[str, Any],
+    ) -> pa.Table:
+        """Fetch a chunk over the requests-backed (HTTP/1.1) S3 pool."""
         url = chunk["url"]
         url_preview = _truncate_url(url)
         started = time.monotonic()
@@ -677,22 +805,29 @@ class Transport:
             ) as resp:
                 if resp.status_code != 200:
                     body_preview = resp.text[:256] if resp.content else ""
+                    if resp.status_code in _S3_RETRYABLE_STATUS:
+                        raise _RetryableChunkError(
+                            f"HTTP {resp.status_code} from S3 "
+                            f"({url_preview}): {body_preview}",
+                        )
                     raise QueryExecutionError(
                         f"Failed to fetch result chunk {url_preview} "
-                        f"(HTTP {resp.status_code}): {body_preview}"
+                        f"(HTTP {resp.status_code}): {body_preview}",
                     )
                 resp.raw.decode_content = True
                 try:
                     reader = paipc.RecordBatchStreamReader(resp.raw)
                     table = reader.read_all()
                 except (pa.ArrowInvalid, pa.ArrowIOError) as ex:
-                    raise QueryExecutionError(
-                        f"Result chunk {url_preview} is not a valid "
-                        f"Arrow IPC stream: {ex}"
+                    raise _RetryableChunkError(
+                        f"chunk {url_preview} parse failed "
+                        f"(likely truncated body): {ex}",
+                        cause=ex,
                     ) from ex
         except requests.RequestException as ex:
-            raise TransportError(
-                f"Cannot download result chunk {url_preview}: {ex}"
+            raise _RetryableChunkError(
+                f"transport error fetching chunk {url_preview}: {ex}",
+                cause=ex,
             ) from ex
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -704,13 +839,90 @@ class Transport:
         )
         return table
 
+    def _download_chunk_once_http2(
+        self,
+        chunk: dict[str, Any],
+    ) -> pa.Table:
+        """Fetch a chunk over the httpx HTTP/2 client.
+
+        Buffers the body in memory (chunks are typically 20 MB so
+        peak overhead is bounded by ``parallel_workers * chunk_bytes``)
+        then parses the Arrow IPC stream from a ``BytesIO``. The
+        single-connection multiplex over HTTP/2 saves one TLS
+        handshake and TCP slow-start per concurrent chunk.
+        """
+        assert self._s3_http2_client is not None
+        url = chunk["url"]
+        url_preview = _truncate_url(url)
+        started = time.monotonic()
+        try:
+            response = self._s3_http2_client.get(url)
+        except httpx.HTTPError as ex:
+            raise _RetryableChunkError(
+                f"transport error fetching chunk {url_preview}: {ex}",
+                cause=ex,
+            ) from ex
+
+        try:
+            if response.status_code != 200:
+                body_preview = response.text[:256] if response.content else ""
+                if response.status_code in _S3_RETRYABLE_STATUS:
+                    raise _RetryableChunkError(
+                        f"HTTP {response.status_code} from S3 "
+                        f"({url_preview}): {body_preview}",
+                    )
+                raise QueryExecutionError(
+                    f"Failed to fetch result chunk {url_preview} "
+                    f"(HTTP {response.status_code}): {body_preview}",
+                )
+            body = response.content
+        finally:
+            response.close()
+
+        try:
+            reader = paipc.RecordBatchStreamReader(io.BytesIO(body))
+            table = reader.read_all()
+        except (pa.ArrowInvalid, pa.ArrowIOError) as ex:
+            raise _RetryableChunkError(
+                f"chunk {url_preview} parse failed "
+                f"(likely truncated body): {ex}",
+                cause=ex,
+            ) from ex
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _logger.debug(
+            "h2 chunk done url=%s rows=%s elapsed_ms=%s",
+            url_preview,
+            table.num_rows,
+            elapsed_ms,
+        )
+        return table
+
+    def _compute_chunk_backoff(self, attempt: int) -> float:
+        """Exponential backoff with jitter, capped at a sane ceiling.
+
+        Avoids retry storms when many concurrent chunks fail in
+        lockstep: each worker draws independent jitter so they spread
+        out across the backoff window.
+        """
+        base = max(self._config.backoff_seconds, 0.05)
+        delay = base * (2**attempt)
+        jitter = random.uniform(0.0, base)
+        return min(delay + jitter, _CHUNK_BACKOFF_CEILING_SECONDS)
+
     def _build_s3_session(self) -> requests.Session:
-        """Build the S3-side session with retries and connection pool."""
+        """Build the S3-side session with retries and connection pool.
+
+        urllib3 handles connect/read retries here. Status-code retries
+        are deliberately disabled because the app-level retry around
+        :meth:`_download_chunk_once` covers them; doubling the retry
+        layers would produce ``max_retries^2`` worst-case round trips.
+        """
         retry = Retry(
             total=self._config.max_retries,
             connect=self._config.max_retries,
             read=self._config.max_retries,
-            status=self._config.max_retries,
+            status=0,
             backoff_factor=self._config.backoff_seconds,
             status_forcelist=tuple(_S3_RETRYABLE_STATUS),
             allowed_methods=("GET",),
@@ -729,6 +941,35 @@ class Transport:
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
+
+    def _build_s3_http2_client(self) -> httpx.Client:
+        """Build the httpx HTTP/2 client used for chunk downloads.
+
+        ``http2=True`` enables the h2 negotiation; servers that don't
+        support h2 transparently fall back to HTTP/1.1 so the client
+        is safe to enable broadly. ``Limits`` mirror the requests
+        pool sizing so concurrent chunks see uniform behavior across
+        the two backends.
+        """
+        timeout = httpx.Timeout(
+            connect=float(self._config.connect_timeout_seconds),
+            read=float(self._config.query_timeout_seconds),
+            write=float(self._config.connect_timeout_seconds),
+            pool=float(self._config.connect_timeout_seconds),
+        )
+        limits = httpx.Limits(
+            max_connections=max(
+                self._config.pool_maxsize,
+                self._config.parallel_workers,
+            ),
+            max_keepalive_connections=self._config.pool_maxsize,
+        )
+        return httpx.Client(
+            http2=True,
+            timeout=timeout,
+            limits=limits,
+            follow_redirects=False,
+        )
 
 
 def _validate_executor(executor: str) -> None:

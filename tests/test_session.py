@@ -153,3 +153,83 @@ def test_session_rejects_empty_sql() -> None:
         pytest.raises(QueryValidationError),
     ):
         s.query("")
+
+
+@responses.activate
+def test_iter_batches_split_with_explicit_bounds() -> None:
+    """Two splits over an integer range produce interleaved batches."""
+    _stub_session_lifecycle()
+    left = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+    right = pa.table({"id": pa.array([4, 5, 6], type=pa.int64())})
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={
+            "schema": [{"columnName": "id", "dataType": "BIGINT"}],
+            "totalRecords": 3,
+            "hasMore": False,
+            "chunks": [{"url": S3_URL_TEMPLATE.format(0)}],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={
+            "schema": [{"columnName": "id", "dataType": "BIGINT"}],
+            "totalRecords": 3,
+            "hasMore": False,
+            "chunks": [{"url": S3_URL_TEMPLATE.format(1)}],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body=_arrow_ipc_bytes(left),
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(1),
+        body=_arrow_ipc_bytes(right),
+        status=200,
+    )
+
+    with LakehouseClient(_config()) as client, client.start_session() as s:
+        rows: list[int] = []
+        for batch in s.iter_batches_split(
+            "SELECT id FROM customers",
+            split_by="id",
+            splits=2,
+            bounds=(1, 6),
+        ):
+            rows.extend(batch.column("id").to_pylist())
+
+    assert sorted(rows) == [1, 2, 3, 4, 5, 6]
+
+
+@responses.activate
+def test_iter_batches_split_validates_inputs() -> None:
+    """Negative splits, empty split_by, and stopped sessions are rejected."""
+    _stub_session_lifecycle()
+
+    with LakehouseClient(_config()) as client, client.start_session() as s:
+        with pytest.raises(QueryValidationError):
+            list(
+                s.iter_batches_split(
+                    "SELECT 1",
+                    split_by="",
+                    splits=2,
+                    bounds=(0, 10),
+                ),
+            )
+        with pytest.raises(QueryValidationError):
+            list(
+                s.iter_batches_split(
+                    "SELECT 1",
+                    split_by="id",
+                    splits=0,
+                    bounds=(0, 10),
+                ),
+            )

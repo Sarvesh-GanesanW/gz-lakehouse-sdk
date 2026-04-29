@@ -24,6 +24,8 @@ time.
 
 from __future__ import annotations
 
+import queue
+import threading
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from types import TracebackType
@@ -32,13 +34,19 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from gz_lakehouse._logging import get_logger
-from gz_lakehouse.exceptions import QueryValidationError
+from gz_lakehouse.exceptions import (
+    QueryExecutionError,
+    QueryValidationError,
+)
 from gz_lakehouse.result import QueryResult
 
 if TYPE_CHECKING:
     from gz_lakehouse._transport import ExecutorChoice, Transport
     from gz_lakehouse.config import LakehouseConfig
     from gz_lakehouse.pipeline_config import PipelineConfig
+
+_SPLIT_QUEUE_DEPTH_PER_THREAD = 4
+_SPLIT_THREAD_JOIN_TIMEOUT = 5.0
 
 _logger = get_logger("session")
 
@@ -134,6 +142,110 @@ class Session:
             executor=executor,
             pipeline=pipeline,
         )
+
+    def iter_batches_split(
+        self,
+        sql: str,
+        split_by: str,
+        splits: int = 4,
+        bounds: tuple[Any, Any] | None = None,
+        batch_size: int = 65_536,
+        executor: ExecutorChoice = "auto",
+        pipeline: PipelineConfig | None = None,
+    ) -> Iterator[pa.RecordBatch]:
+        """Stream a query split across N parallel range queries.
+
+        Splits ``[low, high]`` of ``split_by`` into ``splits`` uniform
+        sub-ranges, runs each as a parallel statement on this session,
+        and interleaves the resulting :class:`pyarrow.RecordBatch`
+        objects to the caller. Useful when one statement would exceed
+        the per-request timeout cap or saturate a single pod's
+        encoder pool.
+
+        ``bounds`` is auto-probed via ``SELECT MIN(col), MAX(col)
+        FROM (sql) AS sub`` if not supplied. Pass it explicitly when
+        you already know the range — a single ``MIN/MAX`` over a
+        billion-row table is itself expensive.
+
+        Trade-offs:
+
+        * ``split_by`` must be an integer or timestamp column with
+          reasonable distribution across the range. A skewed column
+          (90% in one sub-range) will tail-bottleneck on one split.
+        * Splits run concurrently against the same session pod, so
+          encoder + upload pools are shared across them. Pick
+          ``splits`` to roughly match the pod's ``parallel_workers``
+          for best balance.
+        * Row order across splits is undefined. Within a split,
+          order is preserved as in :meth:`iter_batches`.
+        """
+        self._validate_sql(sql)
+        self._ensure_open()
+        if not isinstance(splits, int) or splits < 1:
+            raise QueryValidationError(
+                "iter_batches_split requires splits >= 1",
+            )
+        if not split_by or not isinstance(split_by, str):
+            raise QueryValidationError(
+                "iter_batches_split requires a non-empty split_by column",
+            )
+
+        resolved_bounds = bounds or self._probe_split_bounds(sql, split_by)
+        low, high = resolved_bounds
+        if low is None or high is None:
+            raise QueryExecutionError(
+                f"split_by={split_by!r} bounds resolved to NULL; "
+                f"pass bounds explicitly or pick another column",
+            )
+
+        range_sqls = _build_split_sqls(sql, split_by, low, high, splits)
+        _logger.info(
+            "iter_batches_split sql=%s split_by=%s splits=%d bounds=(%s, %s)",
+            _truncate_sql(sql),
+            split_by,
+            splits,
+            low,
+            high,
+        )
+
+        if splits == 1:
+            yield from self._transport.iter_batches(
+                self._session_id,
+                range_sqls[0],
+                batch_size=batch_size,
+                executor=executor,
+                pipeline=pipeline,
+            )
+            return
+
+        yield from _interleave_iter_batches(
+            transport=self._transport,
+            session_id=self._session_id,
+            sqls=range_sqls,
+            batch_size=batch_size,
+            executor=executor,
+            pipeline=pipeline,
+        )
+
+    def _probe_split_bounds(
+        self,
+        sql: str,
+        split_by: str,
+    ) -> tuple[Any, Any]:
+        """Run MIN/MAX over the source query to find split bounds."""
+        probe_sql = (
+            f"SELECT MIN({split_by}) AS gz_split_lo, "
+            f"MAX({split_by}) AS gz_split_hi "
+            f"FROM ({sql}) AS gz_split_src"
+        )
+        outcome = self._transport.execute(self._session_id, probe_sql)
+        if outcome.table.num_rows == 0:
+            raise QueryExecutionError(
+                "split bounds probe returned an empty result",
+            )
+        lo = outcome.table.column("gz_split_lo").to_pylist()[0]
+        hi = outcome.table.column("gz_split_hi").to_pylist()[0]
+        return (lo, hi)
 
     def query_parallel(
         self,
@@ -257,3 +369,114 @@ def _render_literal(value: Any) -> str:
         return "NULL"
     escaped = str(value).replace("'", "''")
     return f"'{escaped}'"
+
+
+def _build_split_sqls(
+    sql: str,
+    split_by: str,
+    low: Any,
+    high: Any,
+    splits: int,
+) -> list[str]:
+    """Divide ``[low, high]`` into ``splits`` uniform sub-ranges.
+
+    Currently supports integer and float bounds; non-numeric bounds
+    fall back to a single un-split range so callers don't need to
+    special-case timestamps or strings client-side. The last split
+    uses the original ``high`` to avoid floating-point drift losing
+    rows at the upper edge.
+    """
+    is_numeric = isinstance(low, (int, float)) and not isinstance(low, bool)
+    if splits == 1 or not is_numeric:
+        return [_compose_partitioned_sql(sql, split_by, low, high)]
+
+    span = high - low
+    step = span / splits
+    statements: list[str] = []
+    for i in range(splits):
+        sub_low = low + i * step
+        sub_high = high if i == splits - 1 else low + (i + 1) * step
+        if isinstance(low, int) and isinstance(high, int):
+            sub_low = int(round(sub_low))
+            sub_high = int(round(sub_high))
+        statements.append(
+            _compose_partitioned_sql(sql, split_by, sub_low, sub_high),
+        )
+    return statements
+
+
+def _interleave_iter_batches(
+    transport: Transport,
+    session_id: str,
+    sqls: Sequence[str],
+    batch_size: int,
+    executor: ExecutorChoice,
+    pipeline: PipelineConfig | None,
+) -> Iterator[pa.RecordBatch]:
+    """Run ``sqls`` concurrently and interleave their batches.
+
+    Each SQL gets its own worker thread that pushes batches into a
+    bounded shared queue; the main generator yields from the queue
+    in arrival order. A shutdown event is set on the first error so
+    in-flight workers can exit before the queue stays half-drained.
+    """
+    out_queue: queue.Queue[Any] = queue.Queue(
+        maxsize=max(len(sqls) * _SPLIT_QUEUE_DEPTH_PER_THREAD, len(sqls)),
+    )
+    sentinel = object()
+    error_box: list[BaseException] = []
+    shutdown = threading.Event()
+
+    def _drain_one(split_sql: str) -> None:
+        try:
+            for batch in transport.iter_batches(
+                session_id,
+                split_sql,
+                batch_size=batch_size,
+                executor=executor,
+                pipeline=pipeline,
+            ):
+                if shutdown.is_set():
+                    return
+                out_queue.put(batch)
+        except BaseException as ex:
+            if not error_box:
+                error_box.append(ex)
+            shutdown.set()
+        finally:
+            out_queue.put(sentinel)
+
+    threads = [
+        threading.Thread(
+            target=_drain_one,
+            args=(split_sql,),
+            name=f"sdk-split-{i}",
+            daemon=True,
+        )
+        for i, split_sql in enumerate(sqls)
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        remaining = len(sqls)
+        while remaining > 0:
+            item = out_queue.get()
+            if item is sentinel:
+                remaining -= 1
+                continue
+            yield item
+        if error_box:
+            raise error_box[0]
+    finally:
+        shutdown.set()
+        for thread in threads:
+            thread.join(timeout=_SPLIT_THREAD_JOIN_TIMEOUT)
+
+
+def _truncate_sql(sql: str, limit: int = 80) -> str:
+    """Return a short preview of an SQL statement for log messages."""
+    flat = " ".join(sql.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 3] + "..."

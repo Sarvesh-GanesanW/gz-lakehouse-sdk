@@ -361,3 +361,135 @@ def test_chunk_download_failure_surfaces() -> None:
         transport.execute(SESSION_ID, "SELECT 1")
     transport.close()
     http.close()
+
+
+@responses.activate
+def test_chunk_download_retries_on_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 503 from S3 retries until success without restarting the query."""
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    table = pa.table({"id": pa.array([1, 2], type=pa.int64())})
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={
+            "schema": [],
+            "chunks": [{"url": S3_URL_TEMPLATE.format(0)}],
+            "totalRecords": 2,
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body="slow down",
+        status=503,
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body=_arrow_ipc_bytes(table),
+        status=200,
+    )
+
+    config = _config(max_retries=2, backoff_seconds=0.0)
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        outcome = transport.execute(SESSION_ID, "SELECT 1")
+        assert outcome.table.num_rows == 2
+    finally:
+        transport.close()
+        http.close()
+
+
+@responses.activate
+def test_chunk_download_no_retry_on_403() -> None:
+    """A 403 is deterministic and skips the retry loop entirely."""
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={
+            "schema": [],
+            "chunks": [{"url": S3_URL_TEMPLATE.format(0)}],
+            "totalRecords": 1,
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(0),
+        body="forbidden",
+        status=403,
+    )
+
+    config = _config(max_retries=4)
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        with pytest.raises(QueryExecutionError):
+            transport.execute(SESSION_ID, "SELECT 1")
+    finally:
+        transport.close()
+        http.close()
+    s3_calls = [c for c in responses.calls if c.request.method == "GET"]
+    assert len(s3_calls) == 1, (
+        f"403 must not retry; saw {len(s3_calls)} attempts"
+    )
+
+
+@responses.activate
+def test_query_key_in_payload_is_stable() -> None:
+    """Identical queries produce identical queryKey hashes."""
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={"schema": [], "totalRecords": 0, "chunks": []},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        json={"schema": [], "totalRecords": 0, "chunks": []},
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        transport.execute(SESSION_ID, "SELECT * FROM t")
+        transport.execute(SESSION_ID, "SELECT * FROM t")
+    finally:
+        transport.close()
+        http.close()
+
+    bodies = [_json.loads(c.request.body) for c in responses.calls]
+    assert bodies[0]["queryKey"] == bodies[1]["queryKey"]
+    assert len(bodies[0]["queryKey"]) == 32
+
+
+@responses.activate
+def test_query_key_changes_with_sql() -> None:
+    """Different SQL → different queryKey."""
+    for _ in range(2):
+        responses.add(
+            responses.POST,
+            f"{PROVIDER_URL}/iceberg/v1/statements",
+            json={"schema": [], "totalRecords": 0, "chunks": []},
+            status=200,
+        )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        transport.execute(SESSION_ID, "SELECT * FROM a")
+        transport.execute(SESSION_ID, "SELECT * FROM b")
+    finally:
+        transport.close()
+        http.close()
+
+    bodies = [_json.loads(c.request.body) for c in responses.calls]
+    assert bodies[0]["queryKey"] != bodies[1]["queryKey"]
