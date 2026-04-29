@@ -76,6 +76,15 @@ class LakehouseConfig:
             S3 endpoint supports h2). Defaults to ``False`` while the
             new path bakes; flip to ``True`` for production after
             verifying in your environment.
+        defer_poll_max_seconds: Maximum total wall-clock time the SDK
+            will spend polling for a deferred statement before
+            surfacing :class:`TransportError`. The provider switches
+            a long-running statement out of synchronous streaming with
+            a ``deferred`` NDJSON event; the SDK then polls
+            ``GET /iceberg/v1/statements/{queryId}`` with bounded
+            exponential backoff. Default 3600s (1 hour) — generous
+            enough for batch-style queries, finite enough that a lost
+            queryId doesn't wedge a caller forever.
     """
 
     lakehouse_url: str
@@ -97,6 +106,7 @@ class LakehouseConfig:
     backoff_seconds: float = 0.5
     enable_compression: bool = True
     enable_http2: bool = False
+    defer_poll_max_seconds: int = 3600
 
     derived_site: str = field(init=False, repr=False)
 
@@ -123,6 +133,7 @@ class LakehouseConfig:
             "pool_connections",
             "pool_maxsize",
             "max_retries",
+            "defer_poll_max_seconds",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or value < 0:

@@ -85,6 +85,9 @@ _DOWNLOAD_BUFFER_BYTES = 1 << 20
 _S3_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 _CHUNK_BACKOFF_CEILING_SECONDS = 30.0
 
+_DEFER_POLL_MIN_SECONDS = 1.0
+_DEFER_POLL_MAX_SECONDS = 30.0
+
 
 class _IterBytesReader(io.RawIOBase):
     """Adapt an ``Iterator[bytes]`` into a ``read(n)``-style file object.
@@ -291,21 +294,15 @@ class Transport:
     ) -> TransportResult:
         """Submit ``sql`` on ``session_id`` and materialise the result.
 
-        Wraps :meth:`_open_event_stream` and collects every chunk
-        into a single :class:`pyarrow.Table`. The wire is NDJSON when
-        the provider supports it (chunks land as they're produced
-        on the pod) and a legacy JSON envelope otherwise; the
-        consumer code is uniform — both forms surface as a sequence
-        of typed events.
+        Iterates :meth:`_event_stream`, which owns the underlying HTTP
+        responses (sync NDJSON, deferred-then-polled NDJSON, and the
+        legacy JSON envelope all surface as the same event sequence).
+        Every chunk event is dispatched to the shared download pool;
+        the resulting Arrow tables are concatenated in submission order
+        once the stream terminates with a ``done`` event.
         """
         _validate_executor(executor)
         submit_started = time.monotonic()
-        event_iter, response = self._open_event_stream(
-            session_id,
-            sql,
-            executor,
-            pipeline,
-        )
 
         schema: list[dict[str, str]] = []
         pending: list[Future[pa.Table]] = []
@@ -314,12 +311,14 @@ class Transport:
         total_rows = 0
         compressed_bytes = 0
         uncompressed_bytes = 0
-        download_tables: list[pa.Table] = []
-        download_seconds = 0.0
         used_executor: str | None = None
+        download_started: float | None = None
+        download_tables: list[pa.Table] = []
 
         try:
-            for event in event_iter:
+            for event in self._event_stream(
+                session_id, sql, executor, pipeline,
+            ):
                 etype = event.get("type")
                 if etype == "heartbeat":
                     continue
@@ -339,19 +338,18 @@ class Transport:
                     used_executor = event.get("executor")
                     break
                 elif etype == "error":
-                    _cancel_pending(pending)
                     raise QueryExecutionError(_format_error_event(event))
 
             download_started = time.monotonic()
-            try:
-                download_tables = [f.result() for f in pending]
-            except BaseException:
-                _cancel_pending(pending)
-                raise
-            download_seconds = time.monotonic() - download_started
-        finally:
-            if response is not None:
-                response.close()
+            download_tables = [f.result() for f in pending]
+        except BaseException:
+            _cancel_pending(pending)
+            raise
+        download_seconds = (
+            time.monotonic() - download_started
+            if download_started is not None
+            else 0.0
+        )
 
         submit_seconds = (
             first_event_at
@@ -411,16 +409,12 @@ class Transport:
         stays stable for downstream code.
         """
         _validate_executor(executor)
-        event_iter, response = self._open_event_stream(
-            session_id,
-            sql,
-            executor,
-            pipeline,
-        )
         pending: deque[Future[pa.Table]] = deque()
         pool = self._get_download_pool()
         try:
-            for event in event_iter:
+            for event in self._event_stream(
+                session_id, sql, executor, pipeline,
+            ):
                 etype = event.get("type")
                 if etype == "chunk":
                     pending.append(self._submit_chunk(pool, event))
@@ -432,7 +426,6 @@ class Transport:
                 elif etype == "done":
                     break
                 elif etype == "error":
-                    _cancel_pending(pending)
                     raise QueryExecutionError(_format_error_event(event))
 
             while pending:
@@ -440,52 +433,117 @@ class Transport:
                 yield from table.to_batches(max_chunksize=batch_size)
         finally:
             _cancel_pending(pending)
-            if response is not None:
-                response.close()
 
-    def _open_event_stream(
+    def _event_stream(
         self,
         session_id: str,
         sql: str,
         executor: ExecutorChoice,
         pipeline: PipelineConfig | None,
-    ) -> tuple[Iterator[dict[str, Any]], Any]:
-        """Open a request and adapt the response to a stream of events.
+    ) -> Iterator[dict[str, Any]]:
+        """Yield NDJSON events for the statement, owning all responses.
 
-        Sends ``Accept: application/x-ndjson`` so a streaming-capable
-        provider returns its NDJSON form; older providers ignore the
-        header and return the classic JSON envelope. Returns a tuple
-        ``(events, response)``: ``events`` is a generator the caller
-        iterates, ``response`` is the underlying HTTP response (or
-        ``None`` for the legacy path) which the caller is responsible
-        for closing in a ``finally`` block. Legacy responses are read
-        eagerly inside this method, so the response object is closed
-        before return and the generator just walks an in-memory
-        envelope.
+        Three transport shapes converge on a single event sequence:
+
+        1. **Sync NDJSON** — provider streams events; we re-yield until
+           ``done`` (or ``error``) and close the response.
+        2. **Deferred** — provider emits ``deferred(queryId)`` instead
+           of ``done`` when soft-timeout pressure forces it to release
+           the request thread. We close the POST response and switch
+           to GET ``/iceberg/v1/statements/{queryId}`` polling, then
+           re-yield events from the eventual 200 NDJSON response.
+        3. **Legacy envelope** — older provider responds with a JSON
+           manifest; we synthesise the event sequence in-memory.
+
+        Callers iterate one for-loop and never see an HTTP response
+        object — every cleanup path lives in this generator's finally.
         """
         payload = self._build_statement_payload(
-            session_id,
-            sql,
-            executor,
-            pipeline,
+            session_id, sql, executor, pipeline,
         )
-        response = self._http.post(
+        post_response = self._http.post(
             path=_STATEMENTS_PATH,
             json_body=payload,
             timeout_seconds=self._config.query_timeout_seconds,
             accept="application/x-ndjson",
             stream=True,
         )
-
-        if response.content_type == "application/x-ndjson":
-            return self._iter_ndjson(response), response
-
+        deferred_query_id: str | None = None
         try:
-            envelope_body = response.json()
+            if post_response.content_type != "application/x-ndjson":
+                envelope_body = post_response.json()
+                envelope = self._parse_envelope(envelope_body)
+                yield from self._synthesize_events(envelope)
+                return
+
+            for event in self._iter_ndjson(post_response):
+                if event.get("type") == "deferred":
+                    deferred_query_id = self._resolve_deferred_id(event)
+                    break
+                yield event
+            else:
+                return
         finally:
-            response.close()
-        envelope = self._parse_envelope(envelope_body)
-        return self._synthesize_events(envelope), None
+            post_response.close()
+
+        if deferred_query_id is not None:
+            yield from self._poll_deferred_statement(deferred_query_id)
+
+    def _resolve_deferred_id(self, event: dict[str, Any]) -> str:
+        """Extract ``queryId`` from a ``deferred`` event or fail loudly."""
+        query_id = event.get("queryId")
+        if not isinstance(query_id, str) or not query_id:
+            raise TransportError(
+                "Provider sent 'deferred' event without a queryId; "
+                "cannot resume polling",
+            )
+        return query_id
+
+    def _poll_deferred_statement(
+        self,
+        query_id: str,
+    ) -> Iterator[dict[str, Any]]:
+        """Poll ``GET /iceberg/v1/statements/{queryId}`` until 200.
+
+        The provider returns 202 with a ``Retry-After`` header while
+        the pod's manifest has not yet landed in S3, and 200 with the
+        same NDJSON wire as :meth:`_event_stream` once it has. We honor
+        the server-supplied retry hint when present and fall back to a
+        bounded exponential backoff otherwise; the total polling wall
+        is capped by ``LakehouseConfig.defer_poll_max_seconds`` so a
+        lost queryId never wedges the caller.
+        """
+        path = f"{_STATEMENTS_PATH}/{query_id}"
+        deadline = time.monotonic() + self._config.defer_poll_max_seconds
+        delay = _DEFER_POLL_MIN_SECONDS
+        while True:
+            response = self._http.get(
+                path=path,
+                timeout_seconds=self._config.query_timeout_seconds,
+                accept="application/x-ndjson",
+                stream=True,
+            )
+            try:
+                if response.status_code == 200:
+                    yield from self._iter_ndjson(response)
+                    return
+                if response.status_code != 202:
+                    raise TransportError(
+                        f"Polling {path} returned unexpected status "
+                        f"{response.status_code}",
+                    )
+                wait = _resolve_retry_after(response.headers, delay)
+            finally:
+                response.close()
+            now = time.monotonic()
+            if now + wait > deadline:
+                raise TransportError(
+                    f"Deferred statement {query_id} did not complete "
+                    f"within {self._config.defer_poll_max_seconds}s; "
+                    f"giving up",
+                )
+            time.sleep(wait)
+            delay = min(delay * 1.5, _DEFER_POLL_MAX_SECONDS)
 
     def _build_statement_payload(
         self,
@@ -1135,3 +1193,29 @@ def _truncate_url(url: str, head: int = 80, tail: int = 16) -> str:
     if len(url) <= head + tail + 3:
         return url
     return f"{url[:head]}...{url[-tail:]}"
+
+
+def _resolve_retry_after(
+    headers: Any,
+    fallback: float,
+) -> float:
+    """Honor a server-supplied ``Retry-After`` header, clamped to bounds.
+
+    Accepts the seconds-only form (RFC 7231); the HTTP-date form is
+    rare in machine-to-machine APIs and would only add complexity for
+    no measurable benefit here. Falls back to the caller-supplied
+    backoff when the header is absent or unparseable.
+    """
+    def _clamp(value: float) -> float:
+        return min(
+            max(value, _DEFER_POLL_MIN_SECONDS),
+            _DEFER_POLL_MAX_SECONDS,
+        )
+
+    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw is None:
+        return _clamp(fallback)
+    try:
+        return _clamp(float(raw))
+    except (TypeError, ValueError):
+        return _clamp(fallback)

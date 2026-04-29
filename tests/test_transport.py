@@ -757,3 +757,128 @@ def test_ndjson_malformed_line_raises_transport_error() -> None:
     finally:
         transport.close()
         http.close()
+
+
+@responses.activate
+def test_deferred_event_polls_get_until_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred event closes POST and polls GET until 200 returns chunks."""
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    table = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+    query_id = "qid-deferred-1"
+
+    post_body = (
+        b'{"type":"schema","columns":[{"columnName":"id","dataType":"BIGINT"}]}\n'
+        + b'{"type":"deferred","queryId":"' + query_id.encode() + b'"}\n'
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        body=post_body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+    responses.add(
+        responses.GET,
+        f"{PROVIDER_URL}/iceberg/v1/statements/{query_id}",
+        json={"status": "running"},
+        status=202,
+        headers={"Retry-After": "1"},
+    )
+    final_body = (
+        b'{"type":"schema","columns":[{"columnName":"id","dataType":"BIGINT"}]}\n'
+        + b'{"type":"chunk","url":"' + S3_URL_TEMPLATE.format(7).encode() + b'","rowCount":3,"compressedSize":10,"uncompressedSize":20}\n'
+        + b'{"type":"done","totalRecords":3,"executor":"pyiceberg"}\n'
+    )
+    responses.add(
+        responses.GET,
+        f"{PROVIDER_URL}/iceberg/v1/statements/{query_id}",
+        body=final_body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+    responses.add(
+        responses.GET,
+        S3_URL_TEMPLATE.format(7),
+        body=_arrow_ipc_bytes(table),
+        status=200,
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        outcome = transport.execute(SESSION_ID, "SELECT id FROM t")
+    finally:
+        transport.close()
+        http.close()
+
+    assert outcome.total_rows == 3
+    assert outcome.table.num_rows == 3
+    assert outcome.timings.executor == "pyiceberg"
+
+
+@responses.activate
+def test_deferred_polling_aborts_after_max_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Polling gives up with ``TransportError`` once the deadline expires."""
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    times = iter([0.0] + [10000.0] * 20)
+    monkeypatch.setattr("time.monotonic", lambda: next(times))
+
+    query_id = "qid-deferred-loop"
+    post_body = (
+        b'{"type":"schema","columns":[]}\n'
+        + b'{"type":"deferred","queryId":"' + query_id.encode() + b'"}\n'
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        body=post_body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+    responses.add(
+        responses.GET,
+        f"{PROVIDER_URL}/iceberg/v1/statements/{query_id}",
+        json={"status": "running"},
+        status=202,
+    )
+
+    config = _config(defer_poll_max_seconds=5)
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        with pytest.raises(TransportError, match="did not complete within"):
+            transport.execute(SESSION_ID, "SELECT 1")
+    finally:
+        transport.close()
+        http.close()
+
+
+@responses.activate
+def test_deferred_event_without_query_id_fails_loud() -> None:
+    """A deferred event missing ``queryId`` is a wire-protocol violation."""
+    post_body = (
+        b'{"type":"schema","columns":[]}\n'
+        + b'{"type":"deferred"}\n'
+    )
+    responses.add(
+        responses.POST,
+        f"{PROVIDER_URL}/iceberg/v1/statements",
+        body=post_body,
+        status=200,
+        content_type="application/x-ndjson",
+    )
+
+    config = _config()
+    http = _http(config)
+    transport = Transport(http=http, config=config)
+    try:
+        with pytest.raises(TransportError, match="without a queryId"):
+            transport.execute(SESSION_ID, "SELECT 1")
+    finally:
+        transport.close()
+        http.close()
