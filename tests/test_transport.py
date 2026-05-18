@@ -33,6 +33,7 @@ def _config(**overrides: object) -> LakehouseConfig:
         "database": "db",
         "username": "alice",
         "password": "secret",
+        "site_name": "admin",
         "parallel_workers": 4,
     }
     base.update(overrides)
@@ -43,7 +44,7 @@ def _http(config: LakehouseConfig) -> HttpClient:
     """Build the HTTP client used by the transport."""
     return HttpClient(
         base_url=config.lakehouse_url,
-        site=config.derived_site,
+        site=config.site_header,
         connect_timeout_seconds=config.connect_timeout_seconds,
         max_retries=0,
         backoff_seconds=0,
@@ -770,7 +771,9 @@ def test_deferred_event_polls_get_until_complete(
 
     post_body = (
         b'{"type":"schema","columns":[{"columnName":"id","dataType":"BIGINT"}]}\n'
-        + b'{"type":"deferred","queryId":"' + query_id.encode() + b'"}\n'
+        + b'{"type":"deferred","queryId":"'
+        + query_id.encode()
+        + b'"}\n'
     )
     responses.add(
         responses.POST,
@@ -788,7 +791,9 @@ def test_deferred_event_polls_get_until_complete(
     )
     final_body = (
         b'{"type":"schema","columns":[{"columnName":"id","dataType":"BIGINT"}]}\n'
-        + b'{"type":"chunk","url":"' + S3_URL_TEMPLATE.format(7).encode() + b'","rowCount":3,"compressedSize":10,"uncompressedSize":20}\n'
+        + b'{"type":"chunk","url":"'
+        + S3_URL_TEMPLATE.format(7).encode()
+        + b'","rowCount":3,"compressedSize":10,"uncompressedSize":20}\n'
         + b'{"type":"done","totalRecords":3,"executor":"pyiceberg"}\n'
     )
     responses.add(
@@ -831,7 +836,9 @@ def test_deferred_polling_aborts_after_max_seconds(
     query_id = "qid-deferred-loop"
     post_body = (
         b'{"type":"schema","columns":[]}\n'
-        + b'{"type":"deferred","queryId":"' + query_id.encode() + b'"}\n'
+        + b'{"type":"deferred","queryId":"'
+        + query_id.encode()
+        + b'"}\n'
     )
     responses.add(
         responses.POST,
@@ -861,10 +868,7 @@ def test_deferred_polling_aborts_after_max_seconds(
 @responses.activate
 def test_deferred_event_without_query_id_fails_loud() -> None:
     """A deferred event missing ``queryId`` is a wire-protocol violation."""
-    post_body = (
-        b'{"type":"schema","columns":[]}\n'
-        + b'{"type":"deferred"}\n'
-    )
+    post_body = b'{"type":"schema","columns":[]}\n' + b'{"type":"deferred"}\n'
     responses.add(
         responses.POST,
         f"{PROVIDER_URL}/iceberg/v1/statements",

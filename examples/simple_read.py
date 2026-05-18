@@ -6,21 +6,22 @@ Run with credentials from your GroundZero tenant:
     python examples/simple_read.py
 """
 
-from gz_lakehouse import LakehouseClient
+import gz_lakehouse
 
 
 def main() -> None:
     """Connect to a lakehouse provider and print the first rows."""
-    with LakehouseClient.from_kwargs(
+    with gz_lakehouse.connect(
         lakehouse_url=(
             "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
         ),
+        siteName="admin",
         warehouse="my_warehouse",
         database="sales",
         username="user@example.com",
         password="REDACTED",
-    ) as client:
-        result = client.query("SELECT * FROM sales.orders LIMIT 100")
+    ) as conn:
+        result = conn.execute("SELECT * FROM sales.orders LIMIT 100").result
         print(f"rows={result.total_rows} truncated={result.truncated}")
         print(result.to_pandas().head())
 

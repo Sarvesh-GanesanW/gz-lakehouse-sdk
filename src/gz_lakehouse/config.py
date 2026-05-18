@@ -1,8 +1,9 @@
 """Configuration dataclass for the gz-lakehouse SDK.
 
 Holds everything needed to address a GroundZero Lakehouse provider and
-authenticate against it. Validates the URL and derives the ``site``
-component used by the provider's middleware to route requests.
+authenticate against it. The tenant ``siteName`` is an explicit
+connection parameter, matching database connector APIs that avoid
+deriving routing identity from host names.
 
 Performance knobs (``parallel_workers``, ``pool_maxsize``,
 ``enable_http2``) tune the high-throughput data plane. They can be
@@ -14,7 +15,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
-from urllib.parse import urlparse
 
 from gz_lakehouse.exceptions import ConfigurationError
 
@@ -37,12 +37,8 @@ class LakehouseConfig:
         database: Iceberg database (namespace).
         username: Cognito username for the lakehouse tenant.
         password: Cognito password for the lakehouse tenant.
-        site: Optional explicit ``gz-site`` header value. If omitted the
-            site is derived from ``lakehouse_url`` by taking the second
-            hyphen-separated part of the host's first label
-            (``dev-admin-icebergprovider`` → ``admin``). The server then
-            combines this with its own ``ENV`` to form the full
-            ``<env>-<site>`` identifier used to route requests.
+        site_name: Explicit ``gz-site`` header value used by provider
+            middleware to route requests to the right tenant.
         compute_size: T-shirt-size compute selector. One of
             ``small`` / ``medium`` / ``large`` / ``xlarge`` / ``2xlarge``.
             The provider maps the name to a concrete compute id (small
@@ -56,8 +52,8 @@ class LakehouseConfig:
         query_timeout_seconds: Timeout for synchronous query execution.
         connect_timeout_seconds: TCP/TLS handshake timeout enforced
             independently from ``query_timeout_seconds``.
-        parallel_workers: Worker count for the chunked-Parquet transport
-            (parallel S3 fetches) and for :meth:`query_parallel`.
+        parallel_workers: Worker count for Arrow IPC chunk downloads
+            and for :meth:`query_parallel`.
         pool_connections: Number of connection pools the underlying
             session keeps. Forwarded to ``HTTPAdapter``.
         pool_maxsize: Maximum number of connections kept inside each
@@ -92,7 +88,7 @@ class LakehouseConfig:
     database: str
     username: str
     password: str
-    site: str | None = None
+    site_name: str | None = None
     compute_size: ComputeSize = "small"
     compute_id: int | None = None
     minimum_workers: int = 1
@@ -108,16 +104,17 @@ class LakehouseConfig:
     enable_http2: bool = False
     defer_poll_max_seconds: int = 3600
 
-    derived_site: str = field(init=False, repr=False)
+    site_header: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Validate required fields and derive the ``gz-site`` value."""
+        """Validate required fields and normalise the ``gz-site`` value."""
         for name in (
             "lakehouse_url",
             "warehouse",
             "database",
             "username",
             "password",
+            "site_name",
         ):
             value = getattr(self, name)
             if not value or not isinstance(value, str):
@@ -168,15 +165,7 @@ class LakehouseConfig:
                 "LakehouseConfig.minimum_workers must be an int >= 1"
             )
 
-        site_value = self.site or self._derive_site_from_url(
-            self.lakehouse_url
-        )
-        if not site_value:
-            raise ConfigurationError(
-                "Could not derive 'site' from lakehouse_url; "
-                "pass `site` explicitly"
-            )
-        object.__setattr__(self, "derived_site", site_value)
+        object.__setattr__(self, "site_header", self.site_name)
 
     def __repr__(self) -> str:
         """Return a representation that redacts the password."""
@@ -185,9 +174,19 @@ class LakehouseConfig:
             f"LakehouseConfig(lakehouse_url={safe.lakehouse_url!r}, "
             f"warehouse={safe.warehouse!r}, database={safe.database!r}, "
             f"username={safe.username!r}, password={_PASSWORD_REDACTED!r}, "
-            f"site={safe.site!r}, compute_id={safe.compute_id}, "
+            f"site_name={safe.site_name!r}, compute_id={safe.compute_id}, "
             f"parallel_workers={safe.parallel_workers})"
         )
+
+    @property
+    def site(self) -> str:
+        """Return the tenant route used for the ``gz-site`` header."""
+        return self.site_header
+
+    @property
+    def derived_site(self) -> str:
+        """Return the tenant route for older callers."""
+        return self.site_header
 
     @classmethod
     def from_env(
@@ -221,13 +220,20 @@ class LakehouseConfig:
             "database": f"{prefix}DATABASE",
             "username": f"{prefix}USERNAME",
             "password": f"{prefix}PASSWORD",
-            "site": f"{prefix}SITE",
+            "site_name": f"{prefix}SITE_NAME",
         }
         kwargs: dict[str, object] = {}
         for field_name, env_name in env_map.items():
             value = os.environ.get(env_name)
             if value is not None:
                 kwargs[field_name] = value
+        legacy_site = os.environ.get(f"{prefix}SITE")
+        if "site_name" not in kwargs and legacy_site is not None:
+            kwargs["site_name"] = legacy_site
+        if "siteName" in overrides:
+            overrides["site_name"] = overrides.pop("siteName")
+        if "site" in overrides:
+            overrides["site_name"] = overrides.pop("site")
         kwargs.update(overrides)
         try:
             return cls(**kwargs)
@@ -236,26 +242,3 @@ class LakehouseConfig:
                 f"Missing required environment variable for "
                 f"LakehouseConfig: {ex}"
             ) from ex
-
-    @staticmethod
-    def _derive_site_from_url(url: str) -> str:
-        """Extract the site identifier from a provider URL.
-
-        The provider URL host has the shape
-        ``<env>-<site>-<service>.<env>.api.<root>.<tld>``. The
-        ``gz-site`` header expects just the ``<site>`` value, which is
-        the second hyphen-separated part of the host's first label;
-        the server's middleware combines it with the pod's ``ENV`` to
-        form the full ``<env>-<site>`` identifier used for matching.
-
-        Pass ``site`` explicitly to :class:`LakehouseConfig` to override
-        this derivation when the URL does not follow the convention.
-        """
-        host = urlparse(url).hostname or ""
-        first_label = host.split(".")[0] if host else ""
-        if not first_label:
-            return ""
-        parts = first_label.split("-")
-        if len(parts) < 2:
-            return ""
-        return parts[1]

@@ -43,7 +43,7 @@ class LakehouseClient:
         self._config = config
         self._http = HttpClient(
             base_url=config.lakehouse_url,
-            site=config.derived_site,
+            site=config.site_header,
             connect_timeout_seconds=config.connect_timeout_seconds,
             max_retries=config.max_retries,
             backoff_seconds=config.backoff_seconds,
@@ -62,19 +62,20 @@ class LakehouseClient:
         database: str,
         username: str,
         password: str,
-        site: str | None = None,
+        site_name: str | None = None,
         compute_size: str = "small",
         compute_id: int | None = None,
         **extra: Any,
     ) -> LakehouseClient:
         """Build a client without explicitly constructing a config."""
+        site_name = _resolve_site_name(site_name, extra)
         config = LakehouseConfig(
             lakehouse_url=lakehouse_url,
             warehouse=warehouse,
             database=database,
             username=username,
             password=password,
-            site=site,
+            site_name=site_name,
             compute_size=compute_size,
             compute_id=compute_id,
             **extra,
@@ -191,3 +192,23 @@ class LakehouseClient:
         """Run the verification handshake the first time it's needed."""
         if not self._verified:
             self.test_connection()
+
+
+def _resolve_site_name(
+    site_name: str | None,
+    extra: dict[str, Any],
+) -> str:
+    """Resolve explicit tenant routing from Pythonic or wire-style names."""
+    for alias in ("siteName", "site"):
+        if alias in extra:
+            if site_name is not None:
+                raise ConfigurationError(
+                    "Pass only one of site_name, siteName, or site",
+                )
+            value = extra.pop(alias)
+            site_name = value if isinstance(value, str) else None
+    if not site_name:
+        raise ConfigurationError(
+            "siteName is required and must be passed explicitly",
+        )
+    return site_name

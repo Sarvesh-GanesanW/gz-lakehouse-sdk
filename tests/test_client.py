@@ -28,6 +28,7 @@ def _config(**overrides: object) -> LakehouseConfig:
         "database": "db",
         "username": "alice",
         "password": "secret",
+        "site_name": "admin",
     }
     base.update(overrides)
     return LakehouseConfig(**base)

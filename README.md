@@ -1,248 +1,310 @@
 # gz-lakehouse
 
-Plug-and-play Python SDK for the GroundZero Lakehouse — query Iceberg tables over HTTPS from any Python environment, no Spark or JDBC required.
+Python connector for GroundZero Lakehouse. It lets Python applications query
+Iceberg tables over HTTPS without running Spark locally, and it returns results
+as Arrow, pandas, Spark DataFrames, or plain Python rows.
 
-The data plane is Snowflake-style: the provider hands back presigned S3 URLs to Arrow IPC chunks, and the client downloads them in parallel. An explicit **session API** lets you boot a warm compute pod once and run many statements against it; an NDJSON event stream surfaces schema and chunks as they land on the pod, and the first chunk can ride inline so the very first batch reaches the caller without an extra S3 round-trip. Optional HTTP/2 chunk transport (`enable_http2=True`) multiplexes parallel chunk fetches over a single TCP connection.
+The connector uses a Snowflake-style data plane: a GroundZero provider runs the
+statement on warm lakehouse compute, writes Arrow IPC chunks to S3, and returns
+small metadata events with presigned URLs. The SDK downloads those chunks in
+parallel and exposes a familiar `connect().cursor().execute()` workflow.
 
 ## Install
 
 ```bash
-pip install gz-lakehouse              # core
-pip install "gz-lakehouse[pandas]"    # adds pandas DataFrame conversion
-pip install "gz-lakehouse[spark]"     # adds Spark DataFrame conversion
+pip install gz-lakehouse
+pip install "gz-lakehouse[pandas]"
+pip install "gz-lakehouse[spark]"
 ```
 
 ## Quickstart
 
 ```python
+import gz_lakehouse
+
+with gz_lakehouse.connect(
+    lakehouse_url="https://dev-admin-icebergprovider.dev.api.groundzerodev.cloud",
+    siteName="admin",
+    warehouse="TestGZWarehouse",
+    database="lakehouse_db",
+    username="user@example.com",
+    password="****",
+) as conn:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM lakehouse_db.orders LIMIT 1000")
+
+    df = cur.fetch_pandas_all()
+```
+
+`siteName` is required. The SDK does not extract the tenant from
+`lakehouse_url`. The value is sent as the provider's `gz-site` header, so the
+caller must pass the tenant/site intentionally.
+
+## Connector API
+
+The top-level connector API is the recommended shape for application code.
+
+```python
+import gz_lakehouse
+
+conn = gz_lakehouse.connect(
+    lakehouse_url="https://dev-admin-icebergprovider.dev.api.groundzerodev.cloud",
+    siteName="admin",
+    warehouse="TestGZWarehouse",
+    database="lakehouse_db",
+    username="user@example.com",
+    password="****",
+)
+
+try:
+    cur = conn.cursor()
+    cur.execute("SELECT region, count(*) AS rows FROM lakehouse_db.orders GROUP BY region")
+
+    rows = cur.fetchall()
+    arrow_table = cur.fetch_arrow_all()
+    pandas_df = cur.fetch_pandas_all()
+finally:
+    conn.close()
+```
+
+The connection owns one warm compute session. Multiple cursors on the same
+connection reuse that session until `conn.close()` is called.
+
+| API | Purpose |
+| --- | --- |
+| `gz_lakehouse.connect(...)` | Create a connector-style connection. |
+| `conn.cursor()` | Create a cursor bound to the connection's warm session. |
+| `cursor.execute(sql)` | Execute SQL and keep the result on the cursor. |
+| `cursor.fetchone()` | Fetch one remaining row as a mapping. |
+| `cursor.fetchmany(size)` | Fetch up to `size` remaining rows. |
+| `cursor.fetchall()` | Fetch all remaining rows. |
+| `cursor.fetch_arrow_all()` | Return the complete result as a `pyarrow.Table`. |
+| `cursor.fetch_pandas_all()` | Return the complete result as a pandas DataFrame. |
+| `cursor.description` | DB-API-style column metadata. |
+| `cursor.rowcount` | Provider-reported row count for the current result. |
+
+## Client API
+
+The lower-level client API is still available when you want explicit control
+over session objects.
+
+```python
 from gz_lakehouse import LakehouseClient
 
 with LakehouseClient.from_kwargs(
-    lakehouse_url="http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud",
-    warehouse="my_warehouse",
-    database="sales",
+    lakehouse_url="https://dev-admin-icebergprovider.dev.api.groundzerodev.cloud",
+    siteName="admin",
+    warehouse="TestGZWarehouse",
+    database="lakehouse_db",
     username="user@example.com",
     password="****",
 ) as client:
-
-    # Recommended: explicit session, reuses the warm pod across queries.
     with client.start_session() as session:
-        df = session.query("SELECT * FROM sales.orders LIMIT 1000").to_pandas()
-        arrow = session.query("SELECT * FROM customers LIMIT 50").to_arrow()
-        for batch in session.iter_batches(
-            "SELECT * FROM sales.orders WHERE year = 2025",
-        ):
-            ...
-
-    # One-off convenience: auto-creates and stops a session per call.
-    df = client.query("SELECT count(*) FROM sales.orders").to_pandas()
+        result = session.query("SELECT count(*) FROM lakehouse_db.orders")
+        print(result.to_list())
 ```
 
-Or pull credentials from the environment:
+Use the lower-level client when you need `query_parallel`, `iter_batches`, or
+fine-grained executor/pipeline tuning.
+
+## Environment Variables
+
+`LakehouseClient.from_env()` reads these variables:
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `GZ_LAKEHOUSE_URL` | Yes | Provider base URL. |
+| `GZ_LAKEHOUSE_SITE_NAME` | Yes | Tenant/site sent as the `gz-site` header. |
+| `GZ_LAKEHOUSE_WAREHOUSE` | Yes | Iceberg warehouse/catalog name. |
+| `GZ_LAKEHOUSE_DATABASE` | Yes | Default database/namespace. |
+| `GZ_LAKEHOUSE_USERNAME` | Yes | Lakehouse user. |
+| `GZ_LAKEHOUSE_PASSWORD` | Yes | Lakehouse password. |
+
+`GZ_LAKEHOUSE_SITE` is accepted as a compatibility alias, but new code should
+use `GZ_LAKEHOUSE_SITE_NAME`.
+
+## Data Plane
+
+```text
+Python application
+  |
+  | POST /iceberg/startsession
+  |   { computeId, minimumWorkers, connectionConfig }
+  v
+GroundZero provider starts a warm compute session
+  |
+  | POST /iceberg/v1/statements
+  |   { sessionId, query, connectionConfig, executor?, pipelineConfig? }
+  v
+Session pod executes SQL and writes Arrow IPC chunks to S3
+  |
+  | schema/chunk/done NDJSON events
+  | chunk events contain inline Arrow bytes or presigned S3 URLs
+  v
+SDK downloads chunks in parallel and builds a pyarrow.Table
+```
+
+For long-running statements the provider may emit:
+
+```json
+{"type": "deferred", "queryId": "TestGZWarehouse/<queryExecutionId>"}
+```
+
+The SDK then polls:
+
+```text
+GET /iceberg/v1/statements/TestGZWarehouse/<queryExecutionId>
+```
+
+until the manifest is available and the provider replays the same
+schema/chunk/done event stream.
+
+## Result Conversion
 
 ```python
-import os
-os.environ["GZ_LAKEHOUSE_URL"] = "..."
-os.environ["GZ_LAKEHOUSE_WAREHOUSE"] = "..."
-os.environ["GZ_LAKEHOUSE_DATABASE"] = "..."
-os.environ["GZ_LAKEHOUSE_USERNAME"] = "..."
-os.environ["GZ_LAKEHOUSE_PASSWORD"] = "..."
+result = conn.execute("SELECT * FROM lakehouse_db.orders LIMIT 1000").result
 
-with LakehouseClient.from_env() as client, client.start_session() as session:
-    result = session.query("SELECT count(*) FROM sales.orders")
+arrow_table = result.to_arrow()
+pandas_df = result.to_pandas()
+rows = result.to_list()
 ```
 
-The client picks `gz-site` automatically from the URL host (the second hyphen-segment of the first label, i.e. `<env>-<site>-<service>` → `<site>`) and verifies the provider on the first call. The password is redacted from `repr(config)` so it never leaks into stack traces or logs.
-
-### Session vs. one-off
-
-| Mode | Cost | When to use |
-|---|---|---|
-| `with client.start_session() as session: ...` | Pod boot once (~17 s), every query after that is fast | Notebooks, ETL with many statements, anything interactive |
-| `client.query(sql)` | Pod boot **per call** | One-off scripts, smoke tests, stateless workers |
-
-Sessions are explicit so the cost is visible; the convenience wrappers exist so plug-and-play users don't have to think about it.
-
-## Public API
-
-| Symbol                 | Purpose                                                                   |
-| ---------------------- | ------------------------------------------------------------------------- |
-| `LakehouseClient`      | Connect, verify, start sessions, plus one-off convenience wrappers        |
-| `Session`              | Warm compute pod; run queries, stream batches, fan-out partitioned queries |
-| `LakehouseConfig`      | Frozen dataclass for connection params + perf knobs                       |
-| `QueryResult`          | Wraps an Arrow table + schema; converts to pandas / Spark / list          |
-| `GzLakehouseError`     | Base exception                                                            |
-| `AuthenticationError`  | HTTP 401 from provider                                                    |
-| `AuthorizationError`   | HTTP 403 from provider                                                    |
-| `QueryError`           | Parent for query failures (kept for back-compat)                          |
-| `QueryValidationError` | Caller-side query problem (never retried)                                 |
-| `QueryExecutionError`  | Provider-side execution failure                                           |
-| `TransportError`       | Network failure or timeout                                                |
-| `ConfigurationError`   | Invalid configuration                                                     |
-
-## Data plane
-
-```
-   Your Python code
-         │
-         │ POST /iceberg/v1/statements   { query, ... }
-         ▼
-   GroundZero provider
-         │
-         │ executes SQL on ephemeral compute, writes the result to S3 as
-         │ Arrow IPC chunks (~20 MB each, zstd-compressed at the IPC body
-         │ level), returns a small JSON envelope with presigned URLs:
-         │
-         │ { schema, totalRecords, hasMore, chunks: [{url, rowCount, ...}] }
-         ▼
-   Client
-         │ ThreadPoolExecutor (parallel_workers)
-         │   ├── GET <presigned-S3-url-0>  ──► pa.ipc.open_stream → pa.Table
-         │   ├── GET <presigned-S3-url-1>  ──► pa.ipc.open_stream → pa.Table
-         │   └── ...
-         │
-         ▼ pa.concat_tables
-     pa.Table → pandas / Spark / list
-```
-
-Each chunk is parsed straight into a `pyarrow.Table` with no Python-object intermediate. Concatenation is constant time (Arrow tables share buffers), so the only real work the client does is the network read.
-
-### Throughput targets
-
-| Workload                               | Target throughput          | Knob                                       |
-| -------------------------------------- | -------------------------- | ------------------------------------------ |
-| 8 workers, 20 MB chunks, 1 Gb/s link   | **~110 MB/s** (link-bound) | `parallel_workers=8`                       |
-| 16 workers, 20 MB chunks, 10 Gb/s link | **~700 MB/s – 1 GB/s**     | `parallel_workers=16` + `pool_maxsize>=16` |
-| Single-chunk small result              | **~50–100 ms** end to end  | first-chunk latency dominates              |
-
-The numbers scale with `parallel_workers` up to the smaller of (a) the client's bandwidth, (b) the provider's S3 fan-out cap, and (c) the chunk count. Snowflake-class throughput is built in.
-
-### Spark conversion
-
-`result.to_spark(spark)` picks the fastest available conversion path automatically:
-
-| PySpark version | Path                                                                            | Throughput       |
-| --------------- | ------------------------------------------------------------------------------- | ---------------- |
-| **3.4+**        | `spark.createDataFrame(arrow_table)` direct                                     | **100–200 MB/s** |
-| **3.0–3.3**     | Arrow-enabled pandas (auto-toggles `spark.sql.execution.arrow.pyspark.enabled`) | 50–100 MB/s      |
-| **< 3.0**       | Plain pandas (warned about)                                                     | 5–10 MB/s        |
+For Spark:
 
 ```python
-df = result.to_spark(spark)
+spark_df = result.to_spark(spark)
 ```
 
-Empty results keep their column metadata so downstream Spark code does not lose its schema.
-
-For results larger than a few hundred MB, route through Parquet so Spark executors load in parallel instead of pushing every row through the Python driver:
+For larger results, write to Parquet and let Spark read in parallel:
 
 ```python
-df = result.to_spark_via_parquet(spark, "s3://staging-bucket/qid-42/")
+spark_df = result.to_spark_via_parquet(
+    spark,
+    "s3://my-staging-bucket/gz-results/query-123/",
+)
 ```
 
-The Arrow table is written as zstd-compressed Parquet and the returned DataFrame is `spark.read.parquet(path)` — Spark fans the load out across executors.
-
-### Streaming large results
+## Streaming Large Results
 
 ```python
-import pyarrow.parquet as pq
+from gz_lakehouse import LakehouseClient
 
 with LakehouseClient.from_env() as client:
-    writer = None
-    for batch in client.iter_batches(
-        "SELECT * FROM sales.orders WHERE year = 2025",
-        batch_size=131_072,
-    ):
-        if writer is None:
-            writer = pq.ParquetWriter("orders.parquet", batch.schema)
-        writer.write_batch(batch)
-    if writer is not None:
-        writer.close()
+    with client.start_session() as session:
+        for batch in session.iter_batches(
+            "SELECT * FROM lakehouse_db.orders",
+            batch_size=131_072,
+        ):
+            process(batch)
 ```
 
-`iter_batches` yields `pyarrow.RecordBatch` objects in submission order. At most `parallel_workers` chunks are in flight at once, so memory stays bounded regardless of total result size.
+`iter_batches` yields `pyarrow.RecordBatch` objects in result order. At most
+`parallel_workers` chunks are downloaded at once.
 
-### Parallel partitioned queries
-
-`query_parallel` fans out range-partitioned subqueries across the same thread pool. Useful when a single query is heavier than the provider's per-statement budget:
+## Parallel Partitioned Queries
 
 ```python
-result = client.query_parallel(
-    sql_template="SELECT * FROM sales.orders",
-    partition_column="order_id",
-    bounds=[(i * 100_000, (i + 1) * 100_000 - 1) for i in range(10)],
-    max_workers=8,
-)
-df = result.to_pandas()
+with LakehouseClient.from_env() as client:
+    result = client.query_parallel(
+        sql_template="SELECT * FROM lakehouse_db.orders",
+        partition_column="order_id",
+        bounds=[
+            (0, 99_999),
+            (100_000, 199_999),
+            (200_000, 299_999),
+        ],
+        max_workers=3,
+    )
 ```
 
-Each subquery hits `/iceberg/v1/statements` independently, downloads its own presigned chunks, and the resulting Arrow tables are concatenated in submission order.
+Each partition is submitted as its own statement and the Arrow tables are
+concatenated in submission order.
 
-### Performance knobs
+## Performance Knobs
 
-All exposed on `LakehouseConfig`:
+All knobs are available on `LakehouseConfig` and through
+`LakehouseClient.from_kwargs`.
 
-| Field                     | Default | Purpose                                                        |
-| ------------------------- | ------- | -------------------------------------------------------------- |
-| `parallel_workers`        | `8`     | Concurrent chunk downloads (and `query_parallel` fan-out)      |
-| `pool_connections`        | `4`     | HTTP connection pools the session keeps                        |
-| `pool_maxsize`            | `16`    | Max connections per pool (auto-bumped to ≥ `parallel_workers`) |
-| `connect_timeout_seconds` | `10`    | TCP/TLS handshake timeout                                      |
-| `query_timeout_seconds`   | `900`   | Per-request read timeout                                       |
-| `max_retries`             | `3`     | Retries on 408/429/500/502/503/504 (respects `Retry-After`)    |
-| `enable_compression`      | `True`  | Advertise `gzip, deflate, zstd` for the metadata envelope      |
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `parallel_workers` | `32` | Concurrent chunk downloads and `query_parallel` fan-out. |
+| `pool_connections` | `4` | HTTP connection pools kept by the requests session. |
+| `pool_maxsize` | `64` | Maximum connections per pool. |
+| `connect_timeout_seconds` | `10` | TCP/TLS handshake timeout. |
+| `query_timeout_seconds` | `900` | Per-request read timeout. |
+| `max_retries` | `3` | Retries for `408`, `429`, and common `5xx` responses. |
+| `enable_http2` | `False` | Use HTTP/2 for S3 chunk downloads when enabled. |
 
-### Logging
+Throughput scales with the number of chunks, available client bandwidth, and
+S3 read throughput. Small result latency is dominated by session startup unless
+you reuse a connection/session.
 
-The SDK logs to the `gz_lakehouse` namespace with no handlers attached by default. Wire it up the standard way:
+## Provider Contract
 
-```python
-import logging
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("gz_lakehouse").setLevel(logging.DEBUG)
+The current SDK expects the provider to expose these endpoints:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/iceberg/testconnection` | Verify credentials and warehouse access. |
+| `POST` | `/iceberg/startsession` | Start a warm compute session and return `sessionId`. |
+| `POST` | `/iceberg/v1/statements` | Execute SQL on an existing session. |
+| `GET` | `/iceberg/v1/statements/<warehouse>/<queryExecutionId>` | Poll deferred statement results. |
+| `POST` | `/iceberg/stopsession` | Stop the warm compute session. |
+
+`POST /iceberg/v1/statements` sends:
+
+```json
+{
+  "sessionId": "<session-id>",
+  "connectionConfig": {
+    "config": {
+      "userName": "<username>",
+      "password": "<password>",
+      "warehouseName": "<warehouse>"
+    }
+  },
+  "query": "SELECT * FROM lakehouse_db.orders",
+  "executor": "fast",
+  "pipelineConfig": {}
+}
 ```
 
-Each request is tagged with a short `x-gz-request-id` so client and provider logs can be correlated.
+The provider may return either a JSON envelope or an NDJSON event stream. Chunk
+events must contain one of:
 
-## Provider expectations
+```json
+{"type": "chunk", "url": "https://presigned-s3-url", "rowCount": 1000}
+```
 
-The data plane requires the provider to:
+or:
 
-1. Expose `POST /iceberg/v1/statements` accepting `{ query, computeId, connectionConfig: { config: { userName, password, warehouseName } } }`.
-2. Execute the query on ephemeral compute and write the result to S3 as **Arrow IPC streams** with zstd compression at the IPC body level, ~20 MB per chunk (compressed).
-3. Return a small JSON envelope:
-   ```json
-   {
-       "schema": [{"columnName": "id", "dataType": "BIGINT"}, ...],
-       "totalRecords": 10500000,
-       "hasMore": false,
-       "chunks": [
-           {
-               "url": "https://s3.<region>.amazonaws.com/...&X-Amz-...",
-               "rowCount": 200000,
-               "compressedSize": 19834234,
-               "uncompressedSize": 67234234
-           },
-           ...
-       ]
-   }
-   ```
-4. On query failure, return either an HTTP error with a JSON body, or `{ "status": "error", "message": "..." }` with HTTP 200.
-5. Keep the existing `POST /iceberg/testconnection` for credential verification.
+```json
+{"type": "chunk", "inline": "<base64-arrow-ipc>", "rowCount": 1000}
+```
 
-## Roadmap
+## REST Catalog Scope
 
-- Async-native client (`AsyncLakehouseClient`) sharing the same transport layer.
-- `client.write_table(df, ...)` write path uploading Arrow IPC chunks to S3.
-- OpenTelemetry tracing as an optional extra.
-- Server-side cancellation hook so a fast-failing `query_parallel` leg actually frees pod compute.
-- Shared compute-id schema (currently hardcoded both sides as small=1003, medium=1006, large=1009, xlarge=1012, 2xlarge=1015).
+This SDK is not Spark or DuckDB's Iceberg REST catalog client. Spark and DuckDB
+use `/iceberg/v1/config`, namespace, table, view, commit, and credential
+endpoints directly through their Iceberg catalog implementations.
 
-The public API is stable across these upgrades — only the wire format and helpers evolve underneath.
+`gz-lakehouse` is the application data connector. It uses GroundZero's
+statement API to execute SQL on GroundZero compute and return result chunks to
+Python clients.
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
 ruff check src/ tests/
+ruff format --check src/ tests/
 pytest
 ```
+
+## Roadmap
+
+- Async connector API.
+- Server-side cancellation for running statements.
+- Upload/write helpers for DataFrame-to-Iceberg workflows.
+- Optional OpenTelemetry tracing.
+- Catalog metadata helper methods for namespaces, tables, views, and tags.

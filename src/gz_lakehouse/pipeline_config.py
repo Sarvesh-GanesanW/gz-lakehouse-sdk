@@ -13,7 +13,7 @@ The SDK validates ranges client-side before the request leaves the
 laptop, so a typo (``num_encoders=-1``) fails fast instead of after
 a server round trip.
 
-Wire format on ``POST /v1/statements``::
+    Wire format on ``POST /iceberg/v1/statements``::
 
     {
         ...,

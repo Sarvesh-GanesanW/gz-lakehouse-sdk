@@ -5,24 +5,25 @@ Demonstrates how the SDK plugs into a downstream pandas pipeline.
 
 from pathlib import Path
 
-from gz_lakehouse import LakehouseClient
+import gz_lakehouse
 
 
 def main() -> None:
     """Read lakehouse data and persist a transformed CSV."""
-    with LakehouseClient.from_kwargs(
+    with gz_lakehouse.connect(
         lakehouse_url=(
             "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
         ),
+        siteName="admin",
         warehouse="my_warehouse",
         database="sales",
         username="user@example.com",
         password="REDACTED",
-    ) as client:
-        df = client.query(
+    ) as conn:
+        df = conn.execute(
             "SELECT region, sum(amount) AS total "
             "FROM sales.orders GROUP BY region"
-        ).to_pandas()
+        ).fetch_pandas_all()
 
     df["total_thousands"] = df["total"] / 1_000
     out_path = Path("region_totals.csv")

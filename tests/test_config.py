@@ -5,8 +5,8 @@ import pytest
 from gz_lakehouse import ConfigurationError, LakehouseConfig
 
 
-def test_derives_site_from_url() -> None:
-    """``dev-admin-icebergprovider`` host yields site ``admin``."""
+def test_explicit_site_sets_header_value() -> None:
+    """``site`` is the value sent as the ``gz-site`` header."""
     config = LakehouseConfig(
         lakehouse_url=(
             "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
@@ -15,12 +15,13 @@ def test_derives_site_from_url() -> None:
         database="db",
         username="alice",
         password="secret",
+        site_name="admin",
     )
-    assert config.derived_site == "admin"
+    assert config.site_header == "admin"
 
 
-def test_explicit_site_overrides_url() -> None:
-    """Passing ``site`` explicitly wins over URL derivation."""
+def test_site_is_not_derived_from_url() -> None:
+    """The tenant route must be supplied explicitly."""
     config = LakehouseConfig(
         lakehouse_url=(
             "http://dev-admin-icebergprovider.dev.api.groundzerodev.cloud"
@@ -29,9 +30,9 @@ def test_explicit_site_overrides_url() -> None:
         database="db",
         username="alice",
         password="secret",
-        site="custom-site",
+        site_name="custom-site",
     )
-    assert config.derived_site == "custom-site"
+    assert config.site_header == "custom-site"
 
 
 def test_missing_required_field_raises() -> None:
@@ -43,14 +44,15 @@ def test_missing_required_field_raises() -> None:
             database="db",
             username="",
             password="secret",
+            site_name="admin",
         )
 
 
-def test_unparseable_host_raises() -> None:
-    """A host with fewer than two hyphen parts cannot derive a site."""
+def test_missing_site_raises() -> None:
+    """A missing tenant route surfaces as :class:`ConfigurationError`."""
     with pytest.raises(ConfigurationError):
         LakehouseConfig(
-            lakehouse_url="http://only.example.com",
+            lakehouse_url="http://dev-admin-icebergprovider.dev.example.com",
             warehouse="wh",
             database="db",
             username="alice",
@@ -66,6 +68,7 @@ def test_compute_size_default_is_small() -> None:
         database="db",
         username="alice",
         password="secret",
+        site_name="admin",
     )
     assert config.compute_size == "small"
     assert config.compute_id is None
@@ -80,6 +83,7 @@ def test_invalid_compute_size_raises() -> None:
             database="db",
             username="alice",
             password="secret",
+            site_name="admin",
             compute_size="enormous",
         )
 
@@ -92,6 +96,7 @@ def test_compute_id_escape_hatch_accepted() -> None:
         database="db",
         username="alice",
         password="secret",
+        site_name="admin",
         compute_id=1009,
     )
     assert config.compute_id == 1009
@@ -106,6 +111,7 @@ def test_perf_knob_validation() -> None:
             database="db",
             username="alice",
             password="secret",
+            site_name="admin",
             parallel_workers=0,
         )
 
@@ -118,6 +124,7 @@ def test_repr_redacts_password() -> None:
         database="db",
         username="alice",
         password="super-secret",
+        site_name="admin",
     )
     assert "super-secret" not in repr(config)
     assert "***" in repr(config)
@@ -130,10 +137,12 @@ def test_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GZ_LAKEHOUSE_DATABASE", "db")
     monkeypatch.setenv("GZ_LAKEHOUSE_USERNAME", "alice")
     monkeypatch.setenv("GZ_LAKEHOUSE_PASSWORD", "secret")
+    monkeypatch.setenv("GZ_LAKEHOUSE_SITE_NAME", "admin")
 
     config = LakehouseConfig.from_env()
     assert config.warehouse == "wh"
     assert config.username == "alice"
+    assert config.site_name == "admin"
 
 
 def test_from_env_overrides_take_precedence(
@@ -145,6 +154,7 @@ def test_from_env_overrides_take_precedence(
     monkeypatch.setenv("GZ_LAKEHOUSE_DATABASE", "db")
     monkeypatch.setenv("GZ_LAKEHOUSE_USERNAME", "alice")
     monkeypatch.setenv("GZ_LAKEHOUSE_PASSWORD", "secret")
+    monkeypatch.setenv("GZ_LAKEHOUSE_SITE_NAME", "admin")
 
     config = LakehouseConfig.from_env(warehouse="wh-override")
     assert config.warehouse == "wh-override"
@@ -160,6 +170,8 @@ def test_from_env_missing_field_raises(
         "GZ_LAKEHOUSE_DATABASE",
         "GZ_LAKEHOUSE_USERNAME",
         "GZ_LAKEHOUSE_PASSWORD",
+        "GZ_LAKEHOUSE_SITE",
+        "GZ_LAKEHOUSE_SITE_NAME",
     ):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(ConfigurationError):

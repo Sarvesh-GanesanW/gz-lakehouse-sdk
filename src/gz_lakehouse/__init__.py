@@ -10,6 +10,11 @@ from gz_lakehouse._transport import ExecutorChoice
 from gz_lakehouse._version import __version__
 from gz_lakehouse.client import LakehouseClient
 from gz_lakehouse.config import LakehouseConfig
+from gz_lakehouse.connector import (
+    LakehouseConnection,
+    LakehouseCursor,
+    connect,
+)
 from gz_lakehouse.exceptions import (
     AuthenticationError,
     AuthorizationError,
@@ -31,7 +36,9 @@ __all__ = [
     "ExecutorChoice",
     "GzLakehouseError",
     "LakehouseClient",
+    "LakehouseConnection",
     "LakehouseConfig",
+    "LakehouseCursor",
     "PipelineConfig",
     "QueryError",
     "QueryExecutionError",
@@ -40,4 +47,5 @@ __all__ = [
     "Session",
     "TransportError",
     "__version__",
+    "connect",
 ]

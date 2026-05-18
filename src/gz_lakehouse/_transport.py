@@ -317,7 +317,10 @@ class Transport:
 
         try:
             for event in self._event_stream(
-                session_id, sql, executor, pipeline,
+                session_id,
+                sql,
+                executor,
+                pipeline,
             ):
                 etype = event.get("type")
                 if etype == "heartbeat":
@@ -413,7 +416,10 @@ class Transport:
         pool = self._get_download_pool()
         try:
             for event in self._event_stream(
-                session_id, sql, executor, pipeline,
+                session_id,
+                sql,
+                executor,
+                pipeline,
             ):
                 etype = event.get("type")
                 if etype == "chunk":
@@ -459,7 +465,10 @@ class Transport:
         object — every cleanup path lives in this generator's finally.
         """
         payload = self._build_statement_payload(
-            session_id, sql, executor, pipeline,
+            session_id,
+            sql,
+            executor,
+            pipeline,
         )
         post_response = self._http.post(
             path=_STATEMENTS_PATH,
@@ -552,7 +561,7 @@ class Transport:
         executor: ExecutorChoice,
         pipeline: PipelineConfig | None,
     ) -> dict[str, Any]:
-        """Compose the request body for ``POST /v1/statements``."""
+        """Compose the request body for ``POST /iceberg/v1/statements``."""
         payload: dict[str, Any] = {
             "sessionId": session_id,
             "connectionConfig": {
@@ -1206,6 +1215,7 @@ def _resolve_retry_after(
     no measurable benefit here. Falls back to the caller-supplied
     backoff when the header is absent or unparseable.
     """
+
     def _clamp(value: float) -> float:
         return min(
             max(value, _DEFER_POLL_MIN_SECONDS),
